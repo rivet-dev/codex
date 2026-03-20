@@ -1,7 +1,6 @@
 use super::*;
-use crate::config::ConfigBuilder;
 use chrono::TimeZone;
-use codex_features::Feature;
+use crate::RolloutConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
@@ -18,6 +17,16 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+fn test_rollout_config(codex_home: &Path) -> RolloutConfig {
+    RolloutConfig::new(
+        codex_home.to_path_buf(),
+        codex_home.to_path_buf(),
+        codex_home.to_path_buf(),
+        "test-provider".to_string(),
+        false,
+    )
+}
 
 fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<PathBuf> {
     let day_dir = root.join("sessions/2025/01/03");
@@ -54,10 +63,7 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
 #[tokio::test]
 async fn recorder_materializes_only_after_explicit_persist() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
-    let config = ConfigBuilder::default()
-        .codex_home(home.path().to_path_buf())
-        .build()
-        .await?;
+    let config = test_rollout_config(home.path());
     let thread_id = ThreadId::new();
     let recorder = RolloutRecorder::new(
         &config,
@@ -141,14 +147,7 @@ async fn recorder_materializes_only_after_explicit_persist() -> std::io::Result<
 #[tokio::test]
 async fn metadata_irrelevant_events_touch_state_db_updated_at() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
-    let mut config = ConfigBuilder::default()
-        .codex_home(home.path().to_path_buf())
-        .build()
-        .await?;
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
+    let config = test_rollout_config(home.path());
 
     let state_db = StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
         .await
@@ -229,14 +228,7 @@ async fn metadata_irrelevant_events_touch_state_db_updated_at() -> std::io::Resu
 async fn metadata_irrelevant_events_fall_back_to_upsert_when_thread_missing() -> std::io::Result<()>
 {
     let home = TempDir::new().expect("temp dir");
-    let mut config = ConfigBuilder::default()
-        .codex_home(home.path().to_path_buf())
-        .build()
-        .await?;
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
+    let config = test_rollout_config(home.path());
 
     let state_db = StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
         .await
@@ -280,14 +272,7 @@ async fn metadata_irrelevant_events_fall_back_to_upsert_when_thread_missing() ->
 #[tokio::test]
 async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
-    let mut config = ConfigBuilder::default()
-        .codex_home(home.path().to_path_buf())
-        .build()
-        .await?;
-    config
-        .features
-        .disable(Feature::Sqlite)
-        .expect("test config should allow sqlite to be disabled");
+    let config = test_rollout_config(home.path());
 
     let newest = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::from_u128(9001))?;
     let middle = write_session_file(home.path(), "2025-01-02T12-00-00", Uuid::from_u128(9002))?;
@@ -296,6 +281,7 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
     let default_provider = config.model_provider_id.clone();
     let page1 = RolloutRecorder::list_threads(
         &config,
+        None,
         1,
         None,
         ThreadSortKey::CreatedAt,
@@ -311,6 +297,7 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
 
     let page2 = RolloutRecorder::list_threads(
         &config,
+        None,
         1,
         Some(&cursor),
         ThreadSortKey::CreatedAt,
@@ -328,14 +315,7 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
 #[tokio::test]
 async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
-    let mut config = ConfigBuilder::default()
-        .codex_home(home.path().to_path_buf())
-        .build()
-        .await?;
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
+    let config = test_rollout_config(home.path());
 
     let uuid = Uuid::from_u128(9010);
     let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
@@ -375,6 +355,7 @@ async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Resul
     let default_provider = config.model_provider_id.clone();
     let page = RolloutRecorder::list_threads(
         &config,
+        Some(runtime.as_ref()),
         10,
         None,
         ThreadSortKey::CreatedAt,
@@ -396,14 +377,7 @@ async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Resul
 #[tokio::test]
 async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
-    let mut config = ConfigBuilder::default()
-        .codex_home(home.path().to_path_buf())
-        .build()
-        .await?;
-    config
-        .features
-        .enable(Feature::Sqlite)
-        .expect("test config should allow sqlite");
+    let config = test_rollout_config(home.path());
 
     let uuid = Uuid::from_u128(9011);
     let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
@@ -444,6 +418,7 @@ async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Resul
     let default_provider = config.model_provider_id.clone();
     let page = RolloutRecorder::list_threads(
         &config,
+        Some(runtime.as_ref()),
         1,
         None,
         ThreadSortKey::CreatedAt,
