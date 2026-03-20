@@ -42,7 +42,6 @@ codex-execpolicy = { workspace = true }
 codex-file-search = { workspace = true }
 codex-git = { workspace = true }
 codex-hooks = { workspace = true }
-codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-artifacts = { workspace = true }
 codex-protocol = { workspace = true }
@@ -53,12 +52,10 @@ codex-utils-absolute-path = { workspace = true }
 codex-utils-cache = { workspace = true }
 codex-utils-image = { workspace = true }
 codex-utils-home-dir = { workspace = true }
-codex-utils-pty = { workspace = true }
 codex-utils-readiness = { workspace = true }
 codex-secrets = { workspace = true }
 codex-utils-string = { workspace = true }
 codex-utils-stream-parser = { workspace = true }
-codex-windows-sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
 csv = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
@@ -101,9 +98,9 @@ time = { workspace = true, features = [
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
-    "process",
-    "rt-multi-thread",
-    "signal",
+    "rt",
+    "sync",
+    "time",
 ] }
 tokio-util = { workspace = true, features = ["rt"] }
 tokio-tungstenite = { workspace = true }
@@ -115,6 +112,14 @@ uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 which = { workspace = true }
 wildmatch = { workspace = true }
 zip = { workspace = true }
+
+# Platform-specific deps gated out on WASI
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+codex-network-proxy = { workspace = true }
+codex-utils-pty = { workspace = true }
+libc = { workspace = true }
+notify = { workspace = true }
+tokio = { workspace = true, features = ["process", "rt-multi-thread", "signal"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }
@@ -132,6 +137,7 @@ openssl-sys = { workspace = true, features = ["vendored"] }
 openssl-sys = { workspace = true, features = ["vendored"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+codex-windows-sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_Com",

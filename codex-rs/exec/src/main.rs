@@ -9,23 +9,30 @@
 //!
 //! This allows us to ship a completely separate set of functionality as part
 //! of the `codex-exec` binary.
-use clap::Parser;
-use codex_arg0::Arg0DispatchPaths;
-use codex_arg0::arg0_dispatch_or_else;
-use codex_exec::Cli;
-use codex_exec::run_main;
-use codex_utils_cli::CliConfigOverrides;
 
-#[derive(Parser, Debug)]
-struct TopCli {
-    #[clap(flatten)]
-    config_overrides: CliConfigOverrides,
-
-    #[clap(flatten)]
-    inner: Cli,
+#[cfg(target_os = "wasi")]
+fn main() -> anyhow::Result<()> {
+    codex_exec::wasi_stub_main()
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn main() -> anyhow::Result<()> {
+    use clap::Parser;
+    use codex_arg0::Arg0DispatchPaths;
+    use codex_arg0::arg0_dispatch_or_else;
+    use codex_exec::Cli;
+    use codex_exec::run_main;
+    use codex_utils_cli::CliConfigOverrides;
+
+    #[derive(Parser, Debug)]
+    struct TopCli {
+        #[clap(flatten)]
+        config_overrides: CliConfigOverrides,
+
+        #[clap(flatten)]
+        inner: Cli,
+    }
+
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         let top_cli = TopCli::parse();
         // Merge root-level overrides into inner CLI struct so downstream logic remains unchanged.
@@ -42,8 +49,19 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use clap::Parser;
+    use codex_exec::Cli;
+    use codex_utils_cli::CliConfigOverrides;
     use pretty_assertions::assert_eq;
+
+    #[derive(Parser, Debug)]
+    struct TopCli {
+        #[clap(flatten)]
+        config_overrides: CliConfigOverrides,
+
+        #[clap(flatten)]
+        inner: Cli,
+    }
 
     #[test]
     fn top_cli_parses_resume_prompt_after_config_flag() {

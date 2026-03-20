@@ -9,8 +9,11 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "sync", "time"] }
+
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
 portable-pty = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["process", "rt-multi-thread"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
