@@ -268,7 +268,7 @@ impl RolloutRecorder {
         // Warm the DB by repairing every filesystem hit before querying SQLite.
         for item in &fs_page.items {
             state_db::read_repair_rollout_path(
-                state_db_ctx.as_deref(),
+                state_db_ctx,
                 item.thread_id,
                 Some(archived),
                 item.path.as_path(),
@@ -277,7 +277,7 @@ impl RolloutRecorder {
         }
 
         if let Some(db_page) = state_db::list_threads_db(
-            state_db_ctx.as_deref(),
+            state_db_ctx,
             codex_home,
             page_size,
             cursor,
@@ -315,7 +315,7 @@ impl RolloutRecorder {
             let mut db_cursor = cursor.cloned();
             loop {
                 let Some(db_page) = state_db::list_threads_db(
-                    state_db_ctx.as_deref(),
+                    state_db_ctx,
                     codex_home,
                     page_size,
                     db_cursor.as_ref(),
