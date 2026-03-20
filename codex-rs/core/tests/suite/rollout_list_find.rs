@@ -4,16 +4,17 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use chrono::Utc;
-use codex_core::EventPersistenceMode;
-use codex_core::RolloutRecorder;
-use codex_core::RolloutRecorderParams;
 use codex_core::config::ConfigBuilder;
-use codex_core::find_archived_thread_path_by_id_str;
-use codex_core::find_thread_path_by_id_str;
-use codex_core::find_thread_path_by_name_str;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::SessionSource;
+use codex_rollout::EventPersistenceMode;
+use codex_rollout::RolloutConfig;
+use codex_rollout::RolloutRecorder;
+use codex_rollout::RolloutRecorderParams;
+use codex_rollout::find_archived_thread_path_by_id_str;
+use codex_rollout::find_thread_path_by_id_str;
+use codex_rollout::find_thread_path_by_name_str;
 use codex_state::StateRuntime;
 use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
@@ -48,6 +49,16 @@ fn write_minimal_rollout_with_id_in_subdir(codex_home: &Path, subdir: &str, id: 
     .unwrap();
 
     file
+}
+
+fn rollout_config(config: &codex_core::config::Config) -> RolloutConfig {
+    RolloutConfig::new(
+        config.codex_home.clone(),
+        config.sqlite_home.clone(),
+        config.cwd.clone(),
+        config.model_provider_id.clone(),
+        config.memories.generate_memories,
+    )
 }
 
 /// Create sessions/YYYY/MM/DD and write a minimal rollout file containing the
@@ -162,10 +173,11 @@ async fn find_locates_rollout_file_written_by_recorder() -> std::io::Result<()> 
         .codex_home(home.path().to_path_buf())
         .build()
         .await?;
+    let rollout_config = rollout_config(&config);
     let thread_id = ThreadId::new();
     let thread_name = "named thread";
     let recorder = RolloutRecorder::new(
-        &config,
+        &rollout_config,
         RolloutRecorderParams::new(
             thread_id,
             None,

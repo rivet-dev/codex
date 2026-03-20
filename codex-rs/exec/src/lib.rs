@@ -59,6 +59,7 @@ use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::format_config_error_with_source;
 use codex_core::format_exec_policy_error_with_source;
 use codex_core::git_info::get_git_repo_root;
+use codex_core::state_db::get_state_db;
 use codex_feedback::CodexFeedback;
 use codex_otel::set_parent_from_context;
 use codex_otel::traceparent_context_from_env;
@@ -72,6 +73,11 @@ use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::RolloutConfig;
+use codex_rollout::RolloutRecorder;
+use codex_rollout::ThreadSortKey;
+use codex_rollout::find_thread_path_by_id_str;
+use codex_rollout::find_thread_path_by_name_str;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
@@ -101,8 +107,6 @@ use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
-use codex_core::find_thread_path_by_id_str;
-use codex_core::find_thread_path_by_name_str;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 
@@ -156,6 +160,16 @@ fn exec_root_span() -> tracing::Span {
         otel.kind = "internal",
         thread.id = field::Empty,
         turn.id = field::Empty,
+    )
+}
+
+fn rollout_config(config: &Config) -> RolloutConfig {
+    RolloutConfig::new(
+        config.codex_home.clone(),
+        config.sqlite_home.clone(),
+        config.cwd.clone(),
+        config.model_provider_id.clone(),
+        config.memories.generate_memories,
     )
 }
 
@@ -1418,11 +1432,14 @@ async fn resolve_resume_path(
         } else {
             Some(config.cwd.as_path())
         };
-        match codex_core::RolloutRecorder::find_latest_thread_path(
-            config,
+        let rollout_config = rollout_config(config);
+        let state_db_ctx = get_state_db(config).await;
+        match RolloutRecorder::find_latest_thread_path(
+            &rollout_config,
+            state_db_ctx.as_deref(),
             /*page_size*/ 1,
             /*cursor*/ None,
-            codex_core::ThreadSortKey::UpdatedAt,
+            ThreadSortKey::UpdatedAt,
             &[],
             Some(default_provider_filter.as_slice()),
             &config.model_provider_id,

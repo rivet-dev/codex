@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::AuthManager;
-use crate::RolloutRecorder;
 use crate::agent::AgentControl;
 use crate::analytics_client::AnalyticsEventsClient;
 use crate::client::ModelClient;
@@ -23,6 +22,7 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use codex_exec_server::Environment;
 use codex_hooks::Hooks;
 use codex_otel::SessionTelemetry;
+use codex_rollout::RolloutRecorder;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::PathBuf;
 use tokio::sync::Mutex;

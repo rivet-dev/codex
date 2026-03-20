@@ -43,9 +43,6 @@ use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnCompleteEvent;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::UserMessageEvent;
-use crate::rollout::policy::EventPersistenceMode;
-use crate::rollout::recorder::RolloutRecorder;
-use crate::rollout::recorder::RolloutRecorderParams;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -74,6 +71,10 @@ use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_rollout::EventPersistenceMode;
+use codex_rollout::RolloutConfig;
+use codex_rollout::RolloutRecorder;
+use codex_rollout::RolloutRecorderParams;
 use core_test_support::tracing::install_test_tracing;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TraceId;
@@ -83,6 +84,16 @@ use tokio::time::sleep;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use codex_protocol::mcp::CallToolResult as McpCallToolResult;
+
+fn rollout_config(config: &Config) -> RolloutConfig {
+    RolloutConfig::new(
+        config.codex_home.clone(),
+        config.sqlite_home.clone(),
+        config.cwd.clone(),
+        config.model_provider_id.clone(),
+        config.memories.generate_memories,
+    )
+}
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
 use rmcp::model::Tool;
@@ -1998,8 +2009,9 @@ async fn wait_for_thread_rollback_failed(rx: &async_channel::Receiver<Event>) ->
 
 async fn attach_rollout_recorder(session: &Arc<Session>) -> PathBuf {
     let config = session.get_config().await;
+    let rollout_config = rollout_config(config.as_ref());
     let recorder = RolloutRecorder::new(
-        config.as_ref(),
+        &rollout_config,
         RolloutRecorderParams::new(
             ThreadId::default(),
             None,
@@ -3915,8 +3927,9 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         state.set_reference_context_item(Some(previous_context_item.clone()));
     }
     let config = session.get_config().await;
+    let rollout_config = rollout_config(config.as_ref());
     let recorder = RolloutRecorder::new(
-        config.as_ref(),
+        &rollout_config,
         RolloutRecorderParams::new(
             ThreadId::default(),
             None,
@@ -4012,8 +4025,9 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         .with_model(next_model.to_string(), &session.services.models_manager)
         .await;
     let config = session.get_config().await;
+    let rollout_config = rollout_config(config.as_ref());
     let recorder = RolloutRecorder::new(
-        config.as_ref(),
+        &rollout_config,
         RolloutRecorderParams::new(
             ThreadId::default(),
             None,

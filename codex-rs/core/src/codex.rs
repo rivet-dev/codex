@@ -38,7 +38,6 @@ use crate::realtime_conversation::handle_audio as handle_realtime_conversation_a
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
-use crate::rollout::session_index;
 use crate::skills::render_skills_section;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
@@ -201,6 +200,16 @@ pub(crate) struct PreviousTurnSettings {
     pub(crate) realtime_active: Option<bool>,
 }
 
+fn rollout_config(config: &Config, cwd: PathBuf) -> RolloutConfig {
+    RolloutConfig::new(
+        config.codex_home.clone(),
+        config.sqlite_home.clone(),
+        cwd,
+        config.model_provider_id.clone(),
+        config.memories.generate_memories,
+    )
+}
+
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::feedback_tags;
 use crate::file_watcher::FileWatcher;
@@ -270,11 +279,6 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
-use crate::rollout::RolloutRecorder;
-use crate::rollout::RolloutRecorderParams;
-use crate::rollout::map_session_init_error;
-use crate::rollout::metadata;
-use crate::rollout::policy::EventPersistenceMode;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::shell;
 use crate::shell_snapshot::ShellSnapshot;
@@ -334,6 +338,14 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::EventPersistenceMode;
+use codex_rollout::RolloutConfig;
+use codex_rollout::RolloutRecorder;
+use codex_rollout::RolloutRecorderParams;
+use codex_rollout::build_thread_metadata_builder;
+use codex_rollout::find_thread_name_by_id;
+use codex_rollout::session_init_error_message;
+use codex_rollout::spawn_backfill_if_needed;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_readiness::Readiness;
 use codex_utils_readiness::ReadinessFlag;
@@ -617,7 +629,7 @@ impl Codex {
         .await
         .map_err(|e| {
             error!("Failed to create session: {e:#}");
-            map_session_init_error(&e, &config.codex_home)
+            CodexErr::Fatal(session_init_error_message(&e, &config.codex_home))
         })?;
         let thread_id = session.conversation_id;
 
@@ -1455,12 +1467,13 @@ impl Session {
             ),
         };
         let state_builder = match &initial_history {
-            InitialHistory::Resumed(resumed) => metadata::builder_from_items(
+            InitialHistory::Resumed(resumed) => build_thread_metadata_builder(
                 resumed.history.as_slice(),
                 resumed.rollout_path.as_path(),
             ),
             InitialHistory::New | InitialHistory::Forked(_) => None,
         };
+        let rollout_config = rollout_config(&config, session_configuration.cwd.clone());
 
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
@@ -1472,8 +1485,9 @@ impl Session {
                 Ok::<_, anyhow::Error>((None, None))
             } else {
                 let state_db_ctx = state_db::init(&config).await;
+                spawn_backfill_if_needed(state_db_ctx.clone(), &rollout_config).await;
                 let rollout_recorder = RolloutRecorder::new(
-                    &config,
+                    &rollout_config,
                     rollout_params,
                     state_db_ctx.clone(),
                     state_builder.clone(),
@@ -1535,7 +1549,7 @@ impl Session {
         })?;
         let rollout_path = rollout_recorder
             .as_ref()
-            .map(|rec| rec.rollout_path.clone());
+            .map(|rec| rec.rollout_path().to_path_buf());
 
         let mut post_session_configured_events = Vec::<Event>::new();
 
@@ -1698,20 +1712,19 @@ impl Session {
             default_shell.shell_snapshot = rx;
             tx
         };
-        let thread_name =
-            match session_index::find_thread_name_by_id(&config.codex_home, &conversation_id)
-                .instrument(info_span!(
-                    "session_init.thread_name_lookup",
-                    otel.name = "session_init.thread_name_lookup",
-                ))
-                .await
-            {
-                Ok(name) => name,
-                Err(err) => {
-                    warn!("Failed to read session index for thread name: {err}");
-                    None
-                }
-            };
+        let thread_name = match find_thread_name_by_id(&config.codex_home, &conversation_id)
+            .instrument(info_span!(
+                "session_init.thread_name_lookup",
+                otel.name = "session_init.thread_name_lookup",
+            ))
+            .await
+        {
+            Ok(name) => name,
+            Err(err) => {
+                warn!("Failed to read session index for thread name: {err}");
+                None
+            }
+        };
         session_configuration.thread_name = thread_name.clone();
         let state = SessionState::new(session_configuration.clone());
         let managed_network_requirements_enabled = config.managed_network_requirements_enabled();
@@ -4403,8 +4416,6 @@ mod handlers {
     use crate::mcp::auth::compute_auth_statuses;
     use crate::mcp::collect_mcp_snapshot_from_manager;
     use crate::review_prompts::resolve_review_request;
-    use crate::rollout::RolloutRecorder;
-    use crate::rollout::session_index;
     use crate::tasks::CompactTask;
     use crate::tasks::UndoTask;
     use crate::tasks::UserShellCommandMode;
@@ -4429,6 +4440,8 @@ mod handlers {
     use codex_protocol::protocol::WarningEvent;
     use codex_protocol::request_permissions::RequestPermissionsResponse;
     use codex_protocol::request_user_input::RequestUserInputResponse;
+    use codex_rollout::RolloutRecorder;
+    use codex_rollout::append_thread_name;
 
     use crate::context_manager::is_user_turn_boundary;
     use codex_protocol::config_types::CollaborationMode;
@@ -5044,9 +5057,7 @@ mod handlers {
         };
 
         let codex_home = sess.codex_home().await;
-        if let Err(e) =
-            session_index::append_thread_name(&codex_home, sess.conversation_id, &name).await
-        {
+        if let Err(e) = append_thread_name(&codex_home, sess.conversation_id, &name).await {
             let event = Event {
                 id: sub_id,
                 msg: EventMsg::Error(ErrorEvent {

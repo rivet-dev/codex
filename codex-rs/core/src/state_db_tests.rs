@@ -1,5 +1,5 @@
 use super::*;
-use crate::rollout::list::parse_cursor;
+use codex_rollout::parse_cursor;
 use pretty_assertions::assert_eq;
 
 #[test]
