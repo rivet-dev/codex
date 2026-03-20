@@ -19,6 +19,8 @@ pub mod policy;
 pub mod recorder;
 pub mod session_index;
 mod state_db;
+#[cfg(test)]
+mod tests;
 
 pub use list::Cursor;
 pub use list::ThreadItem;
