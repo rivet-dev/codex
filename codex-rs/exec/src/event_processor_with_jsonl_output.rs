@@ -406,8 +406,11 @@ impl EventProcessorWithJsonOutput {
                 }
                 match notification.turn.status {
                     TurnStatus::Completed => {
-                        self.final_message =
-                            Self::final_message_from_turn_items(notification.turn.items.as_slice());
+                        if let Some(final_message) =
+                            Self::final_message_from_turn_items(notification.turn.items.as_slice())
+                        {
+                            self.final_message = Some(final_message);
+                        }
                         events.push(ThreadEvent::TurnCompleted(TurnCompletedEvent {
                             usage: self.usage_from_last_total(),
                         }));

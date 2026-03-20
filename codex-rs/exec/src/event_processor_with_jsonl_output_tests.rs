@@ -516,6 +516,34 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
 }
 
 #[test]
+fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() {
+    let mut processor = EventProcessorWithJsonOutput::new(None);
+    processor.final_message = Some("streamed answer".to_string());
+
+    let completed =
+        processor.collect_thread_events(TypedExecEvent::TurnCompleted(TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: Turn {
+                id: "turn-1".to_string(),
+                items: Vec::new(),
+                status: TurnStatus::Completed,
+                error: None,
+            },
+        }));
+
+    assert_eq!(
+        completed,
+        CollectedThreadEvents {
+            events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
+                usage: Usage::default(),
+            })],
+            status: CodexStatus::InitiateShutdown,
+        }
+    );
+    assert_eq!(processor.final_message.as_deref(), Some("streamed answer"));
+}
+
+#[test]
 fn turn_completion_falls_back_to_final_plan_text() {
     let mut processor = EventProcessorWithJsonOutput::new(None);
 

@@ -313,8 +313,11 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             TypedExecEvent::TurnCompleted(notification) => match notification.turn.status {
                 TurnStatus::Completed => {
-                    self.final_message =
-                        final_message_from_turn_items(notification.turn.items.as_slice());
+                    if let Some(final_message) =
+                        final_message_from_turn_items(notification.turn.items.as_slice())
+                    {
+                        self.final_message = Some(final_message);
+                    }
                     self.print_usage();
                     CodexStatus::InitiateShutdown
                 }
@@ -598,5 +601,40 @@ mod tests {
             crate::event_processor::CodexStatus::InitiateShutdown
         );
         assert_eq!(processor.final_message.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn turn_completed_preserves_streamed_final_message_when_turn_items_are_empty() {
+        let mut processor = EventProcessorWithHumanOutput {
+            bold: Style::new(),
+            cyan: Style::new(),
+            dimmed: Style::new(),
+            green: Style::new(),
+            red: Style::new(),
+            yellow: Style::new(),
+            show_agent_reasoning: true,
+            show_raw_agent_reasoning: false,
+            last_message_path: None,
+            final_message: Some("streamed answer".to_string()),
+            last_total_token_usage: None,
+        };
+
+        let status = processor.process_event(TypedExecEvent::TurnCompleted(
+            codex_app_server_protocol::TurnCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn: Turn {
+                    id: "turn-1".to_string(),
+                    items: Vec::new(),
+                    status: TurnStatus::Completed,
+                    error: None,
+                },
+            },
+        ));
+
+        assert_eq!(
+            status,
+            crate::event_processor::CodexStatus::InitiateShutdown
+        );
+        assert_eq!(processor.final_message.as_deref(), Some("streamed answer"));
     }
 }
