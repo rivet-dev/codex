@@ -63,16 +63,19 @@ async fn session_turn() -> anyhow::Result<()> {
             toml::Value::String("on-request".to_string()),
         ),
     ];
+    eprintln!("DBG: loading config");
     let mut config = Config::load_with_cli_overrides(overrides)
         .await
         .context("load config")?;
     config.cwd = std::path::PathBuf::from(cwd);
+    eprintln!("DBG: config loaded; creating auth");
 
     let auth_manager = AuthManager::shared(
         config.codex_home.clone(),
         /*enable_codex_api_key_env*/ true,
         config.cli_auth_credentials_store_mode,
     );
+    eprintln!("DBG: auth created; ThreadManager::new");
 
     let manager = ThreadManager::new(
         &config,
@@ -80,11 +83,13 @@ async fn session_turn() -> anyhow::Result<()> {
         SessionSource::Exec,
         Default::default(),
     );
+    eprintln!("DBG: manager created; start_thread");
     let new_thread = manager
         .start_thread(config.clone())
         .await
         .context("start thread")?;
     let thread = new_thread.thread;
+    eprintln!("DBG: thread started; submitting prompt");
 
     thread
         .submit(Op::UserInput {
@@ -96,9 +101,12 @@ async fn session_turn() -> anyhow::Result<()> {
         })
         .await
         .context("submit prompt")?;
+    eprintln!("DBG: prompt submitted; entering event loop");
 
     loop {
+        eprintln!("DBG: awaiting next_event");
         let Event { id, msg } = thread.next_event().await.context("next_event")?;
+        eprintln!("DBG: got event: {msg:?}");
         match msg {
             EventMsg::AgentMessageDelta(d) => {
                 emit(json!({ "type": "text_delta", "delta": d.delta }));
@@ -158,7 +166,7 @@ async fn session_turn() -> anyhow::Result<()> {
 /// import (`env.sqlite3_load_extension`) that the secure-exec VM runtime doesn't
 /// provide. Define a no-op so the module instantiates; codex never loads sqlite
 /// extensions, so returning SQLITE_ERROR is correct.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn sqlite3_load_extension(
     _db: *mut core::ffi::c_void,
     _z_file: *const core::ffi::c_char,
