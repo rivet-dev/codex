@@ -41,6 +41,15 @@ fn read_line() -> Option<String> {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    // Surface codex-core's internal tracing to stderr (RUST_LOG-gated) so runtime
+    // hangs in the agent loop are diagnosable inside the VM.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -68,7 +77,14 @@ async fn session_turn() -> anyhow::Result<()> {
         .await
         .context("load config")?;
     config.cwd = std::path::PathBuf::from(cwd);
-    eprintln!("DBG: config loaded; creating auth");
+    // wasm32-wasip1 has no tokio::net readiness reactor, so the WebSocket transport
+    // (tokio-tungstenite → tokio::net::TcpStream) can't connect. Force the HTTP
+    // Responses transport (host-brokered via wasi-http) by disabling websockets on
+    // every provider; codex's HTTP path is the supported transport in the VM.
+    for provider in config.model_providers.values_mut() {
+        provider.supports_websockets = false;
+    }
+    eprintln!("DBG: config loaded (websockets disabled); creating auth");
 
     let auth_manager = AuthManager::shared(
         config.codex_home.clone(),
