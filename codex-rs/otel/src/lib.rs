@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod provider;
 pub mod trace_context;
 
+#[cfg(not(target_os = "wasi"))]
 mod otlp;
 mod targets;
 

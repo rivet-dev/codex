@@ -294,7 +294,7 @@ async fn ensure_owner_only_permissions(file: &File) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "wasi"))]
 // On Windows, simply succeed.
 async fn ensure_owner_only_permissions(_file: &File) -> Result<()> {
     Ok(())

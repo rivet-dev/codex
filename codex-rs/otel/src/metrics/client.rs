@@ -15,12 +15,19 @@ use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
 use opentelemetry::metrics::Meter;
 use opentelemetry::metrics::MeterProvider as _;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_TIMEOUT;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::Protocol;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::WithExportConfig;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::WithHttpConfig;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::WithTonicConfig;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::InstrumentKind;
@@ -223,10 +230,13 @@ impl MetricsClient {
             MetricsExporter::InMemory(exporter) => {
                 build_provider(resource, exporter, export_interval, runtime_reader.clone())
             }
+            #[cfg(not(target_os = "wasi"))]
             MetricsExporter::Otlp(exporter) => {
                 let exporter = build_otlp_metric_exporter(exporter, Temporality::Delta)?;
                 build_provider(resource, exporter, export_interval, runtime_reader.clone())
             }
+            #[cfg(target_os = "wasi")]
+            MetricsExporter::Otlp(_) => return Err(MetricsError::ExporterDisabled),
         };
 
         Ok(Self(std::sync::Arc::new(MetricsClientInner {
@@ -329,6 +339,7 @@ where
     (provider, meter)
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn build_otlp_metric_exporter(
     exporter: OtelExporter,
     temporality: Temporality,

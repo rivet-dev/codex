@@ -21,7 +21,7 @@ tungstenite = { workspace = true }
 tracing = { workspace = true }
 eventsource-stream = { workspace = true }
 regex-lite = { workspace = true }
-tokio-util = { workspace = true, features = ["codec"] }
+tokio-util = { workspace = true, features = ["codec", "io"] }
 url = { workspace = true }
 
 [dev-dependencies]

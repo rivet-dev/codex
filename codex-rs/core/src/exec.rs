@@ -981,7 +981,7 @@ async fn consume_output(
             child.start_kill()?;
             (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE), true)
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = wait_ctrl_c() => {
             kill_child_process_group(&mut child)?;
             child.start_kill()?;
             (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
@@ -1083,9 +1083,26 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     })
 }
 
+#[cfg(not(target_os = "wasi"))]
+async fn wait_ctrl_c() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(target_os = "wasi")]
+async fn wait_ctrl_c() {
+    // No Ctrl-C / signals in the secure-exec VM; never fires.
+    std::future::pending::<()>().await;
+}
+
 #[cfg(unix)]
 fn synthetic_exit_status(code: i32) -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code)
+}
+
+#[cfg(target_os = "wasi")]
+fn synthetic_exit_status(code: i32) -> ExitStatus {
+    use std::os::wasi::process::ExitStatusExt;
     std::process::ExitStatus::from_raw(code)
 }
 

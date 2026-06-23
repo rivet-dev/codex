@@ -35,14 +35,12 @@ members = [
     "lmstudio",
     "login",
     "mcp-server",
-    "network-proxy",
     "ollama",
     "process-hardening",
     "protocol",
     "rmcp-client",
     "responses-api-proxy",
     "stdio-to-uds",
-    "otel",
     "tui",
     "tui_app_server",
     "utils/absolute-path",
@@ -319,7 +317,7 @@ walkdir = "2.5.0"
 webbrowser = "1.0"
 which = "8"
 wildmatch = "2.6.1"
-zip = "2.4.2"
+zip = { version = "2.4.2", default-features = false, features = ["deflate", "time"] }
 zstd = "0.13"
 
 wiremock = "0.6"
@@ -389,6 +387,10 @@ inherits = "test"
 opt-level = 0
 
 [patch.crates-io]
+portable-pty = { path = "/home/nathan/agent-e2e/secure-exec/registry/native/stubs/portable-pty-wasi" }
+reqwest = { path = "/home/nathan/agent-e2e/secure-exec/registry/native/stubs/reqwest-shim" }
+tokio = { path = "/tmp/tokio-dev" }
+ctrlc = { path = "/home/nathan/agent-e2e/secure-exec/registry/native/stubs/ctrlc" }
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
 crossterm = { git = "https://github.com/nornagon/crossterm", branch = "nornagon/color-query" }

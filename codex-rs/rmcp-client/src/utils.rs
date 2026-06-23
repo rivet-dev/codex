@@ -88,7 +88,7 @@ pub(crate) fn apply_default_headers(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
     "HOME",
     "LOGNAME",

@@ -1,15 +1,25 @@
 use crate::config::OtelTlsConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use http::Uri;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::tonic_types::transport::Certificate as TonicCertificate;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::tonic_types::transport::Identity as TonicIdentity;
+#[cfg(not(target_os = "wasi"))]
 use reqwest::Certificate as ReqwestCertificate;
+#[cfg(not(target_os = "wasi"))]
 use reqwest::Identity as ReqwestIdentity;
+#[cfg(not(target_os = "wasi"))]
 use reqwest::header::HeaderMap;
+#[cfg(not(target_os = "wasi"))]
 use reqwest::header::HeaderName;
+#[cfg(not(target_os = "wasi"))]
 use reqwest::header::HeaderValue;
 use std::env;
 use std::error::Error;

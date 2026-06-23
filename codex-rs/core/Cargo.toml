@@ -117,6 +117,15 @@ zip = { workspace = true }
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 codex-network-proxy = { workspace = true }
 codex-utils-pty = { workspace = true }
+
+# wasm32-wasip1: codex-utils-pty compiles via the portable-pty wasi backend.
+# codex-network-proxy stays excluded (real crate pulls the rama proxy-server stack +
+# tokio "full"); the in-guest proxy is redundant on wasi (the VM kernel brokers network
+# policy host-side). codex-core's network_proxy usage is satisfied by the expanded
+# secure-exec stub via [patch]-style workspace redirect.
+[target.'cfg(target_os = "wasi")'.dependencies]
+codex-utils-pty = { workspace = true }
+codex-network-proxy = { workspace = true }
 libc = { workspace = true }
 notify = { workspace = true }
 tokio = { workspace = true, features = ["process", "rt-multi-thread", "signal"] }

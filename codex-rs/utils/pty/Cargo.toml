@@ -15,6 +15,13 @@ tokio = { workspace = true, features = ["io-util", "macros", "sync", "time"] }
 portable-pty = { workspace = true }
 tokio = { workspace = true, features = ["process", "rt-multi-thread"] }
 
+# wasm32-wasip1: portable-pty + tokio process compile via the secure-exec toolchain
+# patches (portable-pty wasi backend; tokio wasi process imp). No rt-multi-thread
+# (wasip1 is single-threaded); the VM runs a current-thread runtime.
+[target.'cfg(target_os = "wasi")'.dependencies]
+portable-pty = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 

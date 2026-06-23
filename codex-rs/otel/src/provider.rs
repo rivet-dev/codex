@@ -5,20 +5,31 @@ use crate::metrics::MetricsClient;
 use crate::metrics::MetricsConfig;
 use crate::targets::is_log_export_target;
 use crate::targets::is_trace_safe_target;
+#[cfg(not(target_os = "wasi"))]
 use gethostname::gethostname;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::LogExporter;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::Protocol;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::SpanExporter;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::WithExportConfig;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::WithHttpConfig;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::WithTonicConfig;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
+#[cfg(not(target_os = "wasi"))]
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -64,6 +75,14 @@ impl OtelProvider {
         }
     }
 
+    #[cfg(target_os = "wasi")]
+    pub fn from(_settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
+        // The secure-exec VM does not export telemetry (no OTLP/gRPC exporter on wasi);
+        // the host owns observability. Always inert.
+        Ok(None)
+    }
+
+    #[cfg(not(target_os = "wasi"))]
     pub fn from(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
         let log_enabled = !matches!(settings.exporter, OtelExporter::None);
         let trace_enabled = !matches!(settings.trace_exporter, OtelExporter::None);
@@ -206,9 +225,16 @@ fn resource_attributes(
     attributes
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn detected_host_name() -> Option<String> {
     let host_name = gethostname();
     normalize_host_name(host_name.to_string_lossy().as_ref())
+}
+
+#[cfg(target_os = "wasi")]
+fn detected_host_name() -> Option<String> {
+    // No gethostname syscall in the secure-exec VM; the host owns host identity.
+    None
 }
 
 fn normalize_host_name(host_name: &str) -> Option<String> {
@@ -216,6 +242,7 @@ fn normalize_host_name(host_name: &str) -> Option<String> {
     (!host_name.is_empty()).then(|| host_name.to_owned())
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn build_logger(
     resource: &Resource,
     exporter: &OtelExporter,
@@ -285,6 +312,7 @@ fn build_logger(
     Ok(builder.build())
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn build_tracer_provider(
     resource: &Resource,
     exporter: &OtelExporter,

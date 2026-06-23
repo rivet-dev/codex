@@ -1,17 +1,41 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+#[cfg(not(target_os = "wasi"))]
+mod certs;
+#[cfg(target_os = "wasi")]
+#[path = "certs_wasi.rs"]
 mod certs;
 mod config;
+#[cfg(not(target_os = "wasi"))]
 mod http_proxy;
+#[cfg(target_os = "wasi")]
+#[path = "http_proxy_wasi.rs"]
+mod http_proxy;
+#[cfg(not(target_os = "wasi"))]
+mod mitm;
+#[cfg(target_os = "wasi")]
+#[path = "mitm_wasi.rs"]
 mod mitm;
 mod network_policy;
 mod policy;
 mod proxy;
 mod reasons;
+#[cfg(not(target_os = "wasi"))]
+mod responses;
+#[cfg(target_os = "wasi")]
+#[path = "responses_wasi.rs"]
 mod responses;
 mod runtime;
+#[cfg(not(target_os = "wasi"))]
+mod socks5;
+#[cfg(target_os = "wasi")]
+#[path = "socks5_wasi.rs"]
 mod socks5;
 mod state;
+#[cfg(not(target_os = "wasi"))]
+mod upstream;
+#[cfg(target_os = "wasi")]
+#[path = "upstream_wasi.rs"]
 mod upstream;
 
 pub use config::NetworkMode;

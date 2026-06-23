@@ -20,6 +20,7 @@ pub enum MetricsError {
     #[error("counter increment must be non-negative for {name}: {inc}")]
     NegativeCounterIncrement { name: String, inc: i64 },
 
+    #[cfg(not(target_os = "wasi"))]
     #[error("failed to build OTLP metrics exporter")]
     ExporterBuild {
         #[source]

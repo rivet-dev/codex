@@ -23,7 +23,7 @@ use tracing::debug;
 /// Unix systems handle PATH resolution and script execution natively through
 /// the kernel's shebang (`#!`) mechanism, so this function simply returns
 /// the program name unchanged.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub fn resolve(program: OsString, _env: &HashMap<String, String>) -> std::io::Result<OsString> {
     Ok(program)
 }

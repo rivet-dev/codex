@@ -33,5 +33,22 @@ pub fn create_symlink(
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
-compile_error!("codex-git symlink support is only implemented for Unix and Windows");
+// wasm32-wasip1: std's `os::wasi::fs::symlink_path` is behind the unstable `wasi_ext`
+// feature (unnamable from a stable crate). Git worktree symlink creation is not on the
+// agent session-turn path inside the VM, so provide a compile-only Unsupported stub
+// rather than pulling libc / enabling nightly features into codex-git.
+#[cfg(target_os = "wasi")]
+pub fn create_symlink(
+    _source: &Path,
+    _link_target: &Path,
+    _destination: &Path,
+) -> Result<(), GitToolingError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlink creation is not supported in the secure-exec wasm VM",
+    )
+    .into())
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
+compile_error!("codex-git symlink support is only implemented for Unix, Windows, and WASI");
