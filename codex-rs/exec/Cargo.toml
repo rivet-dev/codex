@@ -19,6 +19,14 @@ workspace = true
 anyhow = { workspace = true }
 
 # All codex deps are gated out on WASI — the WASI target provides stubs
+# wasm32-wasip1: codex-core compiles here now, so the session-turn engine drives it.
+[target.'cfg(target_os = "wasi")'.dependencies]
+codex-core = { workspace = true }
+codex-protocol = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "io-std", "sync", "time"] }
+
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 clap = { workspace = true, features = ["derive"] }
 codex-arg0 = { workspace = true }

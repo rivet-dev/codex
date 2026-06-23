@@ -8,9 +8,17 @@
 // Platform-specific dependencies (tokio process/signal, portable-pty,
 // network proxy, sandbox) are gated out. Only a stub entry point is provided.
 #[cfg(target_os = "wasi")]
+mod session_turn_wasi;
+
+#[cfg(target_os = "wasi")]
 pub fn wasi_stub_main() -> anyhow::Result<()> {
-    eprintln!("codex: WASI runtime support is under development");
-    Ok(())
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--session-turn") {
+        session_turn_wasi::run()
+    } else {
+        eprintln!("codex-exec: only --session-turn is supported on wasm32-wasip1");
+        Ok(())
+    }
 }
 
 // Full native implementation — includes all platform-specific dependencies
