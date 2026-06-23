@@ -152,3 +152,18 @@ async fn session_turn() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// wasm32-wasip1: sqlx's bundled sqlite is built without extension loading, but the
+/// bindings still reference `sqlite3_load_extension`, leaving it as an unresolved host
+/// import (`env.sqlite3_load_extension`) that the secure-exec VM runtime doesn't
+/// provide. Define a no-op so the module instantiates; codex never loads sqlite
+/// extensions, so returning SQLITE_ERROR is correct.
+#[no_mangle]
+pub extern "C" fn sqlite3_load_extension(
+    _db: *mut core::ffi::c_void,
+    _z_file: *const core::ffi::c_char,
+    _z_proc: *const core::ffi::c_char,
+    _pz_err_msg: *mut *mut core::ffi::c_char,
+) -> core::ffi::c_int {
+    1 // SQLITE_ERROR
+}
