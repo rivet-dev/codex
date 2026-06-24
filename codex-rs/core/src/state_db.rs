@@ -26,6 +26,17 @@ pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 /// Initialize the state runtime for thread state persistence and backfill checks. To only be used
 /// inside `core`. The initialization should not be done anywhere else.
 pub(crate) async fn init(config: &Config) -> Option<StateDbHandle> {
+    // wasm32-wasip1 has no working SQLite backend (sqlx-sqlite's blocking worker can't run on the
+    // single-threaded, thread-less runtime; the open fails with ENOTSUP). Skip the state DB entirely
+    // so its failed initialization can't perturb the tokio runtime context used to spawn the agent
+    // submission loop. The session runs without persistent state.
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = config;
+        return None;
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
     let runtime = match codex_state::StateRuntime::init(
         config.sqlite_home.clone(),
         config.model_provider_id.clone(),
@@ -59,10 +70,18 @@ pub(crate) async fn init(config: &Config) -> Option<StateDbHandle> {
         });
     }
     Some(runtime)
+    }
 }
 
 /// Get the DB if the feature is enabled and the DB exists.
 pub async fn get_state_db(config: &Config) -> Option<StateDbHandle> {
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = config;
+        return None;
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
     let state_path = codex_state::state_db_path(config.sqlite_home.as_path());
     if !tokio::fs::try_exists(&state_path).await.unwrap_or(false) {
         return None;
@@ -74,12 +93,20 @@ pub async fn get_state_db(config: &Config) -> Option<StateDbHandle> {
     .await
     .ok()?;
     require_backfill_complete(runtime, config.sqlite_home.as_path()).await
+    }
 }
 
 /// Open the state runtime when the SQLite file exists, without feature gating.
 ///
 /// This is used for parity checks during the SQLite migration phase.
 pub async fn open_if_present(codex_home: &Path, default_provider: &str) -> Option<StateDbHandle> {
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = (codex_home, default_provider);
+        return None;
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
     let db_path = codex_state::state_db_path(codex_home);
     if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
         return None;
@@ -89,6 +116,7 @@ pub async fn open_if_present(codex_home: &Path, default_provider: &str) -> Optio
             .await
             .ok()?;
     require_backfill_complete(runtime, codex_home).await
+    }
 }
 
 async fn require_backfill_complete(

@@ -16,14 +16,57 @@ use anyhow::Context as _;
 use codex_core::AuthManager;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value;
 use serde_json::json;
+
+/// Map the EE protocol `history` array (`[{ "role": "user"|"assistant", "content": "..." }]`) into
+/// codex `RolloutItem`s for `InitialHistory::Forked`, so a resumed multi-turn session replays prior
+/// context. Each turn of `codex-exec --session-turn` is stateless; the adapter sends the full prior
+/// transcript here. Unknown roles are treated as user input.
+fn history_from_start(start: &Value) -> Vec<RolloutItem> {
+    let Some(entries) = start.get("history").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut items = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let role = entry
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            .to_string();
+        let text = entry
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let content = if role == "assistant" {
+            vec![ContentItem::OutputText { text }]
+        } else {
+            vec![ContentItem::InputText { text }]
+        };
+        items.push(RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role,
+            content,
+            end_turn: None,
+            phase: None,
+        }));
+    }
+    items
+}
 
 fn emit(v: Value) {
     let mut out = std::io::stdout();
@@ -50,8 +93,14 @@ pub fn run() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
+    // wasm32-wasip1 is single-threaded with no tokio::net reactor. codex-core drives the agent turn
+    // on an internally `tokio::spawn`ed submission loop, so the runtime must cooperatively schedule
+    // background tasks while our event loop awaits. The current-thread runtime does this correctly as
+    // long as no task blocks the single executor thread (see the shell-snapshot wasi gate). Only the
+    // time driver is needed; there is no I/O reactor on wasi (network I/O is host-brokered and
+    // synchronous from the guest's perspective).
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+        .enable_time()
         .build()?;
     rt.block_on(session_turn())
 }
@@ -72,7 +121,6 @@ async fn session_turn() -> anyhow::Result<()> {
             toml::Value::String("on-request".to_string()),
         ),
     ];
-    eprintln!("DBG: loading config");
     let mut config = Config::load_with_cli_overrides(overrides)
         .await
         .context("load config")?;
@@ -84,28 +132,44 @@ async fn session_turn() -> anyhow::Result<()> {
     for provider in config.model_providers.values_mut() {
         provider.supports_websockets = false;
     }
-    eprintln!("DBG: config loaded (websockets disabled); creating auth");
 
     let auth_manager = AuthManager::shared(
         config.codex_home.clone(),
         /*enable_codex_api_key_env*/ true,
         config.cli_auth_credentials_store_mode,
     );
-    eprintln!("DBG: auth created; ThreadManager::new");
 
+    let auth_for_resume = AuthManager::shared(
+        config.codex_home.clone(),
+        /*enable_codex_api_key_env*/ true,
+        config.cli_auth_credentials_store_mode,
+    );
     let manager = ThreadManager::new(
         &config,
         auth_manager,
         SessionSource::Exec,
         Default::default(),
     );
-    eprintln!("DBG: manager created; start_thread");
-    let new_thread = manager
-        .start_thread(config.clone())
-        .await
-        .context("start thread")?;
+    // Replay prior turns when the adapter sends `history`; otherwise start a fresh thread.
+    let history = history_from_start(&start);
+    let new_thread = if history.is_empty() {
+        manager
+            .start_thread(config.clone())
+            .await
+            .context("start thread")?
+    } else {
+        manager
+            .resume_thread_with_history(
+                config.clone(),
+                InitialHistory::Forked(history),
+                auth_for_resume,
+                /*persist_extended_history*/ false,
+                /*parent_trace*/ None,
+            )
+            .await
+            .context("resume thread with history")?
+    };
     let thread = new_thread.thread;
-    eprintln!("DBG: thread started; submitting prompt");
 
     thread
         .submit(Op::UserInput {
@@ -117,12 +181,9 @@ async fn session_turn() -> anyhow::Result<()> {
         })
         .await
         .context("submit prompt")?;
-    eprintln!("DBG: prompt submitted; entering event loop");
 
     loop {
-        eprintln!("DBG: awaiting next_event");
         let Event { id, msg } = thread.next_event().await.context("next_event")?;
-        eprintln!("DBG: got event: {msg:?}");
         match msg {
             EventMsg::AgentMessageDelta(d) => {
                 emit(json!({ "type": "text_delta", "delta": d.delta }));

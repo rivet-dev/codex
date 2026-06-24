@@ -718,6 +718,38 @@ async fn rollout_writer(
     default_provider: String,
     generate_memories: bool,
 ) -> std::io::Result<()> {
+    // wasm32-wasip1: on-disk rollout persistence is intentionally disabled (the VM is ephemeral and
+    // agent-os resumes via adapter-supplied history, not codex's rollout files; the file-open/write
+    // path also fails on the runtime and would kill this task, spamming "rollout channel closed").
+    // Drain commands so senders never observe a closed channel, and acknowledge Persist/Flush/Shutdown
+    // so callers awaiting their oneshot acks don't hang. Items are discarded.
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = (
+            &file,
+            &deferred_log_file_info,
+            &meta,
+            &cwd,
+            &rollout_path,
+            &state_db_ctx,
+            &state_builder,
+            &default_provider,
+            generate_memories,
+        );
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                RolloutCmd::AddItems(_) => {}
+                RolloutCmd::Persist { ack }
+                | RolloutCmd::Flush { ack }
+                | RolloutCmd::Shutdown { ack } => {
+                    let _ = ack.send(());
+                }
+            }
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
     let mut writer = file.map(|file| JsonlWriter { file });
     let mut buffered_items = Vec::<RolloutItem>::new();
     if let Some(builder) = state_builder.as_mut() {
@@ -833,6 +865,7 @@ async fn rollout_writer(
     }
 
     Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -9,3 +9,12 @@ rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "link-arg=/arm64hazardfree"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']
 rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
+
+[target.wasm32-wasip1]
+rustflags = ["-C", "link-arg=-L/home/nathan/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/wasm32-wasip1/lib/self-contained", "--cfg", "tokio_unstable"]
+
+[env]
+CFLAGS_wasm32_wasip1 = "-D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PTHREAD -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS"
+
+[unstable]
+build-std = ["std", "panic_abort"]

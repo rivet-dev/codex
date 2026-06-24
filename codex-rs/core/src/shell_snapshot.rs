@@ -83,6 +83,24 @@ impl ShellSnapshot {
         shell_snapshot_tx: watch::Sender<Option<Arc<ShellSnapshot>>>,
         session_telemetry: SessionTelemetry,
     ) {
+        // wasm32-wasip1: capturing a shell snapshot spawns a shell subprocess and blocks on its
+        // exit. The VM's child-process bridge can't deliver that wait on the single-threaded runtime
+        // (it pins the executor thread and deadlocks the agent loop). A shell environment snapshot is
+        // not meaningful in the VM anyway, so skip it and proceed with no snapshot.
+        #[cfg(target_os = "wasi")]
+        {
+            let _ = (
+                codex_home,
+                session_id,
+                session_cwd,
+                snapshot_shell,
+                session_telemetry,
+            );
+            let _ = shell_snapshot_tx.send(None);
+            return;
+        }
+        #[cfg(not(target_os = "wasi"))]
+        {
         let snapshot_span = info_span!("shell_snapshot", thread_id = %session_id);
         tokio::spawn(
             async move {
@@ -107,6 +125,7 @@ impl ShellSnapshot {
             }
             .instrument(snapshot_span),
         );
+        }
     }
 
     async fn try_new(

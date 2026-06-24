@@ -49,6 +49,17 @@ pub struct GitDiffToRemote {
 /// Uses timeouts to prevent freezing on large repositories.
 /// All git commands (except the initial repo check) run in parallel for better performance.
 pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
+    // wasm32-wasip1: collecting git info spawns `git` subprocesses and blocks on their exit. The
+    // VM's child-process bridge can't deliver that wait on the single-threaded runtime (it kills the
+    // rollout-recorder task, surfacing as "rollout channel closed" errors). Git metadata is optional
+    // session annotation, so skip it on wasi; the rollout still records without it.
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = cwd;
+        return None;
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
     // Check if we're in a git repository first
     let is_git_repo = run_git_command_with_timeout(&["rev-parse", "--git-dir"], cwd)
         .await?
@@ -100,6 +111,7 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
     }
 
     Some(git_info)
+    }
 }
 
 /// Collect fetch remotes in a multi-root-friendly format: {"origin": "https://..."}.
