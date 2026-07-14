@@ -90,7 +90,7 @@ pub fn run() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
         )
         .try_init();
     // wasm32-wasip1 is single-threaded with no tokio::net reactor. codex-core drives the agent turn
@@ -119,6 +119,10 @@ async fn session_turn() -> anyhow::Result<()> {
         (
             "approval_policy".to_string(),
             toml::Value::String("on-request".to_string()),
+        ),
+        (
+            "features.shell_snapshot".to_string(),
+            toml::Value::Boolean(false),
         ),
     ];
     let mut config = Config::load_with_cli_overrides(overrides)
@@ -182,11 +186,25 @@ async fn session_turn() -> anyhow::Result<()> {
         .await
         .context("submit prompt")?;
 
+    // Whether the current assistant message streamed any deltas. Codex streams
+    // text via AgentMessageDelta when the model streams; when it does not (the
+    // model returns a complete message), only the final AgentMessage event
+    // carries the text. Emit the final message as a text_delta in that case so
+    // the EE stream always carries the assistant text, without double-emitting
+    // when deltas were already streamed.
+    let mut saw_delta = false;
     loop {
         let Event { id, msg } = thread.next_event().await.context("next_event")?;
         match msg {
             EventMsg::AgentMessageDelta(d) => {
+                saw_delta = true;
                 emit(json!({ "type": "text_delta", "delta": d.delta }));
+            }
+            EventMsg::AgentMessage(m) => {
+                if !saw_delta && !m.message.is_empty() {
+                    emit(json!({ "type": "text_delta", "delta": m.message }));
+                }
+                saw_delta = false;
             }
             EventMsg::ExecCommandBegin(e) => {
                 emit(json!({

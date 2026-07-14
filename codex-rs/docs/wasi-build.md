@@ -46,6 +46,15 @@ Three `#[cfg(target_os = "wasi")]` gates in the fork keep that true:
   adapter-supplied `history`, not codex's on-disk rollout).
 - `core/src/state_db.rs` — skip sqlx-sqlite (fails ENOTSUP on the thread-less runtime).
 
+
+## Toolchain fold (secure-exec)
+
+The secure-exec native toolchain drives this build via `make -C registry/native codex` (set `CODEX_REPO`
+if the fork is not at the default sibling path). That target runs `scripts/build-wasi-codex-exec.sh`,
+which prepares + **restores** the rustup sysroot itself, so the build is reproducible from a clean
+checkout with no manual sysroot steps. (`make wasm` still builds the stub commands; `make codex`
+builds the real engine.)
+
 ## Folding into `make -C registry/native wasm` (remaining work)
 
 The secure-exec native Makefile already builds the *stub* `crates/commands/{codex,codex-exec}` with
