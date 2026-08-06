@@ -414,6 +414,7 @@ impl FeedbackSnapshot {
     }
 
     /// Upload feedback to Sentry with optional attachments.
+    #[cfg(not(target_os = "wasi"))]
     pub fn upload_feedback(&self, options: FeedbackUploadOptions<'_>) -> Result<()> {
         use std::str::FromStr;
         use std::sync::Arc;
@@ -534,6 +535,7 @@ impl FeedbackSnapshot {
         tags
     }
 
+    #[cfg(not(target_os = "wasi"))]
     fn feedback_attachments(
         &self,
         include_logs: bool,
