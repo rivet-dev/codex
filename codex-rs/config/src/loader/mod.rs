@@ -51,7 +51,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
 
 #[cfg(windows)]
@@ -630,7 +630,7 @@ pub async fn load_requirements_toml(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(Path::new("/etc/codex/requirements.toml"))
 }
@@ -649,7 +649,7 @@ fn system_requirements_toml_file_with_overrides(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(Path::new(SYSTEM_CONFIG_TOML_FILE_UNIX))
 }
