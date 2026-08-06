@@ -1,12 +1,66 @@
 use super::*;
-use crate::config::types::ShellEnvironmentPolicyInherit;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use maplit::hashmap;
+use pretty_assertions::assert_eq;
 
 fn make_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+}
+
+#[test]
+fn inject_permission_profile_env_overrides_policy_value() {
+    let mut env = HashMap::from([(
+        CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(
+        &mut env,
+        Some(&ActivePermissionProfile::new("current-profile")),
+    );
+
+    assert_eq!(
+        env.get(CODEX_PERMISSION_PROFILE_ENV_VAR)
+            .map(String::as_str),
+        Some("current-profile")
+    );
+}
+
+#[test]
+fn inject_permission_profile_env_removes_stale_value_without_active_profile() {
+    let mut env = HashMap::from([(
+        CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(&mut env, /*active_permission_profile*/ None);
+
+    assert_eq!(env.get(CODEX_PERMISSION_PROFILE_ENV_VAR), None);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn inject_permission_profile_env_replaces_differently_cased_windows_key() {
+    let mut env = HashMap::from([(
+        "codex_permission_profile".to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(
+        &mut env,
+        Some(&ActivePermissionProfile::new("current-profile")),
+    );
+
+    assert_eq!(
+        env,
+        HashMap::from([(
+            CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+            "current-profile".to_string(),
+        )])
+    );
 }
 
 #[test]
@@ -121,7 +175,7 @@ fn populate_env_inserts_thread_id() {
 fn populate_env_omits_thread_id_when_missing() {
     let vars = make_vars(&[("PATH", "/usr/bin")]);
     let policy = ShellEnvironmentPolicy::default();
-    let result = populate_env(vars, &policy, None);
+    let result = populate_env(vars, &policy, /*thread_id*/ None);
 
     let expected: HashMap<String, String> = hashmap! {
         "PATH".to_string() => "/usr/bin".to_string(),
@@ -171,6 +225,7 @@ fn test_inherit_all_with_default_excludes() {
 fn test_core_inherit_respects_case_insensitive_names_on_windows() {
     let vars = make_vars(&[
         ("Path", "C:\\Windows\\System32"),
+        ("PathExt", ".COM;.EXE;.BAT;.CMD"),
         ("TEMP", "C:\\Temp"),
         ("FOO", "bar"),
     ]);
@@ -185,11 +240,53 @@ fn test_core_inherit_respects_case_insensitive_names_on_windows() {
     let result = populate_env(vars, &policy, Some(thread_id));
     let mut expected: HashMap<String, String> = hashmap! {
         "Path".to_string() => "C:\\Windows\\System32".to_string(),
+        "PathExt".to_string() => ".COM;.EXE;.BAT;.CMD".to_string(),
         "TEMP".to_string() => "C:\\Temp".to_string(),
     };
     expected.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
 
     assert_eq!(result, expected);
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn create_env_inserts_pathext_on_windows_when_missing() {
+    let vars = make_vars(&[]);
+
+    let policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::None,
+        ignore_default_excludes: true,
+        ..Default::default()
+    };
+
+    let result = create_env_from_vars(vars, &policy, /*thread_id*/ None);
+
+    let expected: HashMap<String, String> = hashmap! {
+        "PATHEXT".to_string() => ".COM;.EXE;.BAT;.CMD".to_string(),
+    };
+    assert_eq!(result, expected);
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+fn create_env_preserves_existing_pathext_case_insensitively_on_windows() {
+    let vars = make_vars(&[("PathExt", ".COM;.EXE;.BAT;.CMD;.PS1")]);
+
+    let policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::Core,
+        ignore_default_excludes: true,
+        ..Default::default()
+    };
+
+    let result = create_env_from_vars(vars, &policy, /*thread_id*/ None);
+
+    let pathext_vars = result
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("PATHEXT"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(pathext_vars.len(), 1);
+    assert_eq!(pathext_vars[0].1, ".COM;.EXE;.BAT;.CMD;.PS1");
 }
 
 #[test]

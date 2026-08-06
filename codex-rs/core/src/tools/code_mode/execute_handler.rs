@@ -1,202 +1,119 @@
-use async_trait::async_trait;
-use serde::Deserialize;
-
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::registry::ToolHandler;
-use crate::tools::registry::ToolKind;
+use crate::tools::context::boxed_tool_output;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 
-use super::CODE_MODE_PRAGMA_PREFIX;
-use super::CodeModeSessionProgress;
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
-use super::build_enabled_tools;
-use super::handle_node_message;
-use super::protocol::HostToNodeMessage;
-use super::protocol::build_source;
+use super::handle_runtime_response;
+use super::is_exec_tool_name;
 
-pub struct CodeModeExecuteHandler;
-const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
-
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct CodeModeExecPragma {
-    #[serde(default)]
-    yield_time_ms: Option<u64>,
-    #[serde(default)]
-    max_output_tokens: Option<usize>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CodeModeExecArgs {
-    code: String,
-    yield_time_ms: Option<u64>,
-    max_output_tokens: Option<usize>,
+pub struct CodeModeExecuteHandler {
+    spec: ToolSpec,
+    nested_tool_specs: Vec<ToolSpec>,
 }
 
 impl CodeModeExecuteHandler {
+    pub(crate) fn new(spec: ToolSpec, nested_tool_specs: Vec<ToolSpec>) -> Self {
+        Self {
+            spec,
+            nested_tool_specs,
+        }
+    }
+
     async fn execute(
         &self,
-        session: std::sync::Arc<Session>,
-        turn: std::sync::Arc<TurnContext>,
+        session: std::sync::Arc<crate::session::session::Session>,
+        turn: std::sync::Arc<crate::session::turn_context::TurnContext>,
         call_id: String,
         code: String,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
-        let args = parse_freeform_args(&code)?;
+        let args =
+            codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
         let exec = ExecContext { session, turn };
-        let enabled_tools = build_enabled_tools(&exec).await;
-        let service = &exec.session.services.code_mode_service;
-        let stored_values = service.stored_values().await;
-        let source =
-            build_source(&args.code, &enabled_tools).map_err(FunctionCallError::RespondToModel)?;
-        let cell_id = service.allocate_cell_id().await;
-        let request_id = service.allocate_request_id().await;
-        let process_slot = service
-            .ensure_started()
-            .await
-            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+        let enabled_tools =
+            codex_tools::collect_code_mode_tool_definitions(&self.nested_tool_specs);
         let started_at = std::time::Instant::now();
-        let message = HostToNodeMessage::Start {
-            request_id: request_id.clone(),
-            cell_id: cell_id.clone(),
-            tool_call_id: call_id,
-            default_yield_time_ms: super::DEFAULT_EXEC_YIELD_TIME_MS,
-            enabled_tools,
-            stored_values,
-            source,
-            yield_time_ms: args.yield_time_ms,
-            max_output_tokens: args.max_output_tokens,
-        };
-        let result = {
-            let mut process_slot = process_slot;
-            let Some(process) = process_slot.as_mut() else {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "{PUBLIC_TOOL_NAME} runner failed to start"
-                )));
-            };
-            let message = process
-                .send(&request_id, &message)
-                .await
-                .map_err(|err| err.to_string());
-            let message = match message {
-                Ok(message) => message,
-                Err(error) => return Err(FunctionCallError::RespondToModel(error)),
-            };
-            handle_node_message(
-                &exec, cell_id, message, /*poll_max_output_tokens*/ None, started_at,
-            )
+        let started_cell = exec
+            .session
+            .services
+            .code_mode_service
+            .execute(codex_code_mode::ExecuteRequest {
+                tool_call_id: call_id.clone(),
+                enabled_tools,
+                source: args.code.clone(),
+                yield_time_ms: args.yield_time_ms,
+                max_output_tokens: args.max_output_tokens,
+            })
             .await
-        };
-        match result {
-            Ok(CodeModeSessionProgress::Finished(output))
-            | Ok(CodeModeSessionProgress::Yielded { output }) => Ok(output),
-            Err(error) => Err(FunctionCallError::RespondToModel(error)),
+            .map_err(FunctionCallError::RespondToModel)?;
+        let cell_id = started_cell.cell_id.clone();
+        if let Some(executed_tool_calls) = exec.session.services.executed_tool_calls.as_ref() {
+            executed_tool_calls.register_cell(&cell_id, &call_id);
         }
+        let runtime_cell_id = cell_id.to_string();
+        let code_cell_trace = exec
+            .session
+            .services
+            .rollout_thread_trace
+            .start_code_cell_trace(
+                exec.turn.sub_id.as_str(),
+                runtime_cell_id.as_str(),
+                call_id.as_str(),
+                args.code.as_str(),
+            );
+        exec.session
+            .services
+            .code_mode_service
+            .mark_cell_ready_for_dispatch(&cell_id);
+        let response = started_cell
+            .initial_response()
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        // Record the raw runtime boundary. The model-visible custom-tool output
+        // is produced by `handle_runtime_response` and later linked through
+        // `CodeCell.output_item_ids` in the reduced trace.
+        code_cell_trace.record_initial_response(&response);
+        // Yielded cells keep running, so terminal lifecycle is only emitted
+        // here when the first response also ended the runtime.
+        if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+            code_cell_trace.record_ended(&response);
+            exec.session
+                .services
+                .code_mode_service
+                .finish_cell_dispatch(&cell_id);
+        }
+        exec.session.services.elicitations.wait_until_clear().await;
+        handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
+            .await
+            .map_err(FunctionCallError::RespondToModel)
     }
 }
 
-fn parse_freeform_args(input: &str) -> Result<CodeModeExecArgs, FunctionCallError> {
-    if input.trim().is_empty() {
-        return Err(FunctionCallError::RespondToModel(
-            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}`.".to_string(),
-        ));
+impl ToolExecutor<ToolInvocation> for CodeModeExecuteHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(PUBLIC_TOOL_NAME)
     }
 
-    let mut args = CodeModeExecArgs {
-        code: input.to_string(),
-        yield_time_ms: None,
-        max_output_tokens: None,
-    };
-
-    let mut lines = input.splitn(2, '\n');
-    let first_line = lines.next().unwrap_or_default();
-    let rest = lines.next().unwrap_or_default();
-    let trimmed = first_line.trim_start();
-    let Some(pragma) = trimmed.strip_prefix(CODE_MODE_PRAGMA_PREFIX) else {
-        return Ok(args);
-    };
-
-    if rest.trim().is_empty() {
-        return Err(FunctionCallError::RespondToModel(
-            "exec pragma must be followed by JavaScript source on subsequent lines".to_string(),
-        ));
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
     }
 
-    let directive = pragma.trim();
-    if directive.is_empty() {
-        return Err(FunctionCallError::RespondToModel(
-            "exec pragma must be a JSON object with supported fields `yield_time_ms` and `max_output_tokens`"
-                .to_string(),
-        ));
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(self.handle_call(invocation))
     }
-
-    let value: serde_json::Value = serde_json::from_str(directive).map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "exec pragma must be valid JSON with supported fields `yield_time_ms` and `max_output_tokens`: {err}"
-        ))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "exec pragma must be a JSON object with supported fields `yield_time_ms` and `max_output_tokens`"
-                .to_string(),
-        )
-    })?;
-    for key in object.keys() {
-        match key.as_str() {
-            "yield_time_ms" | "max_output_tokens" => {}
-            _ => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "exec pragma only supports `yield_time_ms` and `max_output_tokens`; got `{key}`"
-                )));
-            }
-        }
-    }
-
-    let pragma: CodeModeExecPragma = serde_json::from_value(value).map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "exec pragma fields `yield_time_ms` and `max_output_tokens` must be non-negative safe integers: {err}"
-        ))
-    })?;
-    if pragma
-        .yield_time_ms
-        .is_some_and(|yield_time_ms| yield_time_ms > MAX_JS_SAFE_INTEGER)
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "exec pragma field `yield_time_ms` must be a non-negative safe integer".to_string(),
-        ));
-    }
-    if pragma.max_output_tokens.is_some_and(|max_output_tokens| {
-        u64::try_from(max_output_tokens)
-            .map(|max_output_tokens| max_output_tokens > MAX_JS_SAFE_INTEGER)
-            .unwrap_or(true)
-    }) {
-        return Err(FunctionCallError::RespondToModel(
-            "exec pragma field `max_output_tokens` must be a non-negative safe integer".to_string(),
-        ));
-    }
-    args.code = rest.to_string();
-    args.yield_time_ms = pragma.yield_time_ms;
-    args.max_output_tokens = pragma.max_output_tokens;
-    Ok(args)
 }
 
-#[async_trait]
-impl ToolHandler for CodeModeExecuteHandler {
-    type Output = FunctionToolOutput;
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
-    }
-
-    fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Custom { .. })
-    }
-
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+impl CodeModeExecuteHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -207,9 +124,10 @@ impl ToolHandler for CodeModeExecuteHandler {
         } = invocation;
 
         match payload {
-            ToolPayload::Custom { input } if tool_name == PUBLIC_TOOL_NAME => {
-                self.execute(session, turn, call_id, input).await
-            }
+            ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
+                .execute(session, turn, call_id, input)
+                .await
+                .map(boxed_tool_output),
             _ => Err(FunctionCallError::RespondToModel(format!(
                 "{PUBLIC_TOOL_NAME} expects raw JavaScript source text"
             ))),
@@ -217,6 +135,8 @@ impl ToolHandler for CodeModeExecuteHandler {
     }
 }
 
-#[cfg(test)]
-#[path = "execute_handler_tests.rs"]
-mod execute_handler_tests;
+impl CoreToolRuntime for CodeModeExecuteHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Custom { .. })
+    }
+}

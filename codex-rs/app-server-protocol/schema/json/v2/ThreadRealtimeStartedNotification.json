@@ -4,14 +4,15 @@
     "RealtimeConversationVersion": {
       "enum": [
         "v1",
-        "v2"
+        "v2",
+        "v3"
       ],
       "type": "string"
     }
   },
   "description": "EXPERIMENTAL - emitted when thread realtime startup is accepted.",
   "properties": {
-    "sessionId": {
+    "realtimeSessionId": {
       "type": [
         "string",
         "null"

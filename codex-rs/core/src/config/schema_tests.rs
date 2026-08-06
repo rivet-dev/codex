@@ -53,3 +53,51 @@ Run `just write-config-schema` to overwrite with your changes.\n\n{diff}"
         "fixture should match exactly with generated schema"
     );
 }
+
+#[test]
+fn config_schema_hides_unsupported_inline_mcp_bearer_token() {
+    let schema_json = config_schema_json().expect("serialize config schema");
+    let schema_value: serde_json::Value =
+        serde_json::from_slice(&schema_json).expect("decode schema json");
+    let properties = schema_value
+        .pointer("/definitions/RawMcpServerConfig/properties")
+        .expect("RawMcpServerConfig properties should exist")
+        .as_object()
+        .expect("RawMcpServerConfig properties should be an object");
+
+    assert_eq!(
+        (
+            properties.contains_key("bearer_token"),
+            properties.contains_key("bearer_token_env_var"),
+        ),
+        (false, true),
+    );
+}
+
+#[test]
+fn shell_environment_policy_schema_rejects_mixed_filter_representations() {
+    let schema_json = config_schema_json().expect("serialize config schema");
+    let schema_value: serde_json::Value =
+        serde_json::from_slice(&schema_json).expect("decode schema json");
+    let constraints = schema_value
+        .pointer("/definitions/ShellEnvironmentPolicyToml/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("shell environment policy constraints should be an array");
+    let required_pairs = constraints
+        .iter()
+        .map(|constraint| {
+            constraint
+                .pointer("/not/required")
+                .expect("constraint should prohibit a required-field pair")
+                .clone()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        required_pairs,
+        vec![
+            serde_json::json!(["exclude", "filters"]),
+            serde_json::json!(["filters", "include_only"]),
+        ]
+    );
+}

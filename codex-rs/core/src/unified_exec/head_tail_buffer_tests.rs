@@ -4,7 +4,7 @@ use pretty_assertions::assert_eq;
 
 #[test]
 fn keeps_prefix_and_suffix_when_over_budget() {
-    let mut buf = HeadTailBuffer::new(10);
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
 
     buf.push_chunk(b"0123456789".to_vec());
     assert_eq!(buf.omitted_bytes(), 0);
@@ -16,11 +16,15 @@ fn keeps_prefix_and_suffix_when_over_budget() {
     let rendered = String::from_utf8_lossy(&buf.to_bytes()).to_string();
     assert!(rendered.starts_with("01234"));
     assert!(rendered.ends_with("89ab"));
+    assert_eq!(
+        String::from_utf8_lossy(&buf.to_bytes_with_omission_marker()),
+        "01234\n... 2 bytes omitted ...\n789ab"
+    );
 }
 
 #[test]
 fn max_bytes_zero_drops_everything() {
-    let mut buf = HeadTailBuffer::new(0);
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 0);
     buf.push_chunk(b"abc".to_vec());
 
     assert_eq!(buf.retained_bytes(), 0);
@@ -31,7 +35,7 @@ fn max_bytes_zero_drops_everything() {
 
 #[test]
 fn head_budget_zero_keeps_only_last_byte_in_tail() {
-    let mut buf = HeadTailBuffer::new(1);
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 1);
     buf.push_chunk(b"abc".to_vec());
 
     assert_eq!(buf.retained_bytes(), 1);
@@ -40,22 +44,26 @@ fn head_budget_zero_keeps_only_last_byte_in_tail() {
 }
 
 #[test]
-fn draining_resets_state() {
-    let mut buf = HeadTailBuffer::new(10);
+fn draining_resets_state_and_push_buffer_preserves_omissions() {
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
     buf.push_chunk(b"0123456789".to_vec());
     buf.push_chunk(b"ab".to_vec());
 
-    let drained = buf.drain_chunks();
-    assert!(!drained.is_empty());
+    let drained = buf.drain();
+    let mut collected = HeadTailBuffer::new(/*max_bytes*/ 10);
+    collected.push_buffer(drained);
 
     assert_eq!(buf.retained_bytes(), 0);
     assert_eq!(buf.omitted_bytes(), 0);
     assert_eq!(buf.to_bytes(), b"".to_vec());
+    assert_eq!(collected.to_bytes(), b"01234789ab".to_vec());
+    assert_eq!(collected.omitted_bytes(), 2);
+    assert_eq!(collected.total_bytes(), 12);
 }
 
 #[test]
 fn chunk_larger_than_tail_budget_keeps_only_tail_end() {
-    let mut buf = HeadTailBuffer::new(10);
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
     buf.push_chunk(b"0123456789".to_vec());
 
     // Tail budget is 5 bytes. This chunk should replace the tail and keep only its last 5 bytes.
@@ -69,7 +77,7 @@ fn chunk_larger_than_tail_budget_keeps_only_tail_end() {
 
 #[test]
 fn fills_head_then_tail_across_multiple_chunks() {
-    let mut buf = HeadTailBuffer::new(10);
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
 
     // Fill the 5-byte head budget across multiple chunks.
     buf.push_chunk(b"01".to_vec());
@@ -86,4 +94,21 @@ fn fills_head_then_tail_across_multiple_chunks() {
     buf.push_chunk(b"a".to_vec());
     assert_eq!(buf.to_bytes(), b"012346789a".to_vec());
     assert_eq!(buf.omitted_bytes(), 1);
+}
+
+#[test]
+fn empty_and_tiny_chunks_have_bounded_metadata() {
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
+
+    for byte in b"0123456789ab" {
+        buf.push_chunk(Vec::new());
+        buf.push_chunk(vec![*byte]);
+    }
+
+    assert_eq!(
+        buf.snapshot_chunks(),
+        vec![b"01234".to_vec(), b"789ab".to_vec()]
+    );
+    assert_eq!(buf.retained_bytes(), 10);
+    assert_eq!(buf.omitted_bytes(), 2);
 }

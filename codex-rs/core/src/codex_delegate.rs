@@ -3,7 +3,12 @@ use std::sync::Arc;
 
 use async_channel::Receiver;
 use async_channel::Sender;
+use codex_analytics::GuardianApprovalRequestSource;
 use codex_async_utils::OrCancelExt;
+use codex_core_plugins::PluginCommandAttribution;
+use codex_extension_api::LoadedUserInstructions;
+use codex_plugin::PluginId;
+use codex_protocol::items::is_safe_plugin_relative_path;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -15,6 +20,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
@@ -22,7 +28,6 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -30,71 +35,128 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::AuthManager;
-use crate::codex::Codex;
-use crate::codex::CodexSpawnArgs;
-use crate::codex::CodexSpawnOk;
-use crate::codex::SUBMISSION_CHANNEL_CAPACITY;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::config::Config;
-use crate::error::CodexErr;
 use crate::guardian::GuardianApprovalRequest;
-use crate::guardian::review_approval_request_with_cancel;
+use crate::guardian::GuardianReviewOptions;
+use crate::guardian::new_guardian_review_id;
 use crate::guardian::routes_approval_to_guardian;
+use crate::guardian::routes_approval_to_guardian_with_reviewer;
+use crate::guardian::spawn_approval_request_review;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
+use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::mcp_tool_call::build_guardian_mcp_tool_review_request;
 use crate::mcp_tool_call::is_mcp_tool_approval_question_id;
-use crate::mcp_tool_call::lookup_mcp_tool_metadata;
-use crate::models_manager::manager::ModelsManager;
+use crate::mcp_tool_call::mcp_approvals_reviewer;
+use crate::session::ForkPersistence;
+use crate::session::GitEnrichmentPolicy;
+use crate::session::SUBMISSION_CHANNEL_CAPACITY;
+use crate::session::SessionIo;
+use crate::session::SessionSpawnArgs;
+use crate::session::emit_subagent_session_started;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
+use codex_login::AuthManager;
+use codex_models_manager::manager::SharedModelsManager;
+use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::MultiAgentVersion;
 
 #[cfg(test)]
-use crate::codex::completed_session_loop_termination;
+use crate::session::completed_session_loop_termination;
 
-/// Start an interactive sub-Codex thread and return IO channels.
+#[derive(Clone)]
+struct PendingMcpInvocation {
+    invocation: McpInvocation,
+    metadata: Option<McpToolApprovalMetadata>,
+}
+
+/// Start an interactive sub-Codex thread and return its runtime and IO channels.
 ///
-/// The returned `events_rx` yields non-approval events emitted by the sub-agent.
+/// The returned IO yields non-approval events emitted by the sub-agent.
 /// Approval requests are handled via `parent_session` and are not surfaced.
-/// The returned `ops_tx` allows the caller to submit additional `Op`s to the sub-agent.
+/// Its submission channel accepts additional `Op`s for the sub-agent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_codex_thread_interactive(
     config: Config,
     auth_manager: Arc<AuthManager>,
-    models_manager: Arc<ModelsManager>,
+    models_manager: SharedModelsManager,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
     cancel_token: CancellationToken,
     subagent_source: SubAgentSource,
     initial_history: Option<InitialHistory>,
-) -> Result<Codex, CodexErr> {
+    git_enrichment_policy: GitEnrichmentPolicy,
+    windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
+) -> Result<(Arc<Session>, SessionIo), CodexErr> {
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-
-    let CodexSpawnOk { codex, .. } = Codex::spawn(CodexSpawnArgs {
+    let conversation_history = initial_history.unwrap_or(InitialHistory::New);
+    let forked_from_thread_id = conversation_history.forked_from_id();
+    let user_instructions = LoadedUserInstructions {
+        instructions: parent_session.user_instructions().await,
+        warnings: Vec::new(),
+    };
+    let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
         config,
+        allow_provider_model_fallback: false,
+        user_instructions,
+        installation_id: parent_session.installation_id.clone(),
         auth_manager,
         models_manager,
-        skills_manager: Arc::clone(&parent_session.services.skills_manager),
+        environment_manager: parent_session
+            .services
+            .turn_environments
+            .environment_manager(),
+        skills_service: Arc::clone(&parent_session.services.skills_service),
         plugins_manager: Arc::clone(&parent_session.services.plugins_manager),
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
-        file_watcher: Arc::clone(&parent_session.services.file_watcher),
-        conversation_history: initial_history.unwrap_or(InitialHistory::New),
-        session_source: SessionSource::SubAgent(subagent_source),
+        code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
+        extensions: Arc::clone(&parent_session.services.extensions),
+        conversation_history,
+        requested_history_mode: None,
+        fork_persistence: ForkPersistence::Copied,
+        session_source: SessionSource::SubAgent(subagent_source.clone()),
+        forked_from_thread_id,
+        parent_thread_id: Some(parent_session.thread_id),
+        thread_source: Some(ThreadSource::Subagent),
+        originator: parent_ctx.originator.clone(),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
-        persist_extended_history: false,
         metrics_service_name: None,
-        inherited_shell_snapshot: None,
         user_shell_override: None,
+        inherited_environments: Some(parent_ctx.environments.clone()),
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
+        parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
-    })
-    .await?;
-    let codex = Arc::new(codex);
-
+        environment_selections: parent_ctx.environments.to_selections(),
+        thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
+        supports_openai_form_elicitation: parent_session
+            .services
+            .supports_openai_form_elicitation
+            .load(std::sync::atomic::Ordering::Relaxed),
+        analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
+        thread_store: Arc::clone(&parent_session.services.thread_store),
+        attestation_provider: parent_session.services.attestation_provider.clone(),
+        external_time_provider: Some(Arc::clone(&parent_session.services.time_provider)),
+        inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
+        git_enrichment_policy,
+        windows_sandbox_proxy_settings_mode,
+    }))
+    .or_cancel(&cancel_token)
+    .await??;
+    let thread_config = session.thread_config_snapshot().await;
+    let client_metadata = parent_session.app_server_client_metadata().await;
+    emit_subagent_session_started(
+        &parent_session.services.analytics_events_client,
+        client_metadata,
+        session.session_id(),
+        session.thread_id(),
+        Some(parent_session.thread_id),
+        thread_config,
+        subagent_source,
+    );
     // Use a child token so parent cancel cascades but we can scope it to this task
     let cancel_token_events = cancel_token.child_token();
     let cancel_token_ops = cancel_token.child_token();
@@ -103,14 +165,23 @@ pub(crate) async fn run_codex_thread_interactive(
     // routing them to the parent session for decisions.
     let parent_session_clone = Arc::clone(&parent_session);
     let parent_ctx_clone = Arc::clone(&parent_ctx);
-    let codex_for_events = Arc::clone(&codex);
-    // Cache delegated MCP invocations so guardian can recover the full tool call
-    // context when the later legacy RequestUserInput approval event only carries
-    // a call_id plus approval question metadata.
-    let pending_mcp_invocations = Arc::new(Mutex::new(HashMap::<String, McpInvocation>::new()));
+    let session_for_events = Arc::clone(&session);
+    let io = Arc::new(io);
+    // Cache the child call's MCP metadata at begin time. The later legacy
+    // RequestUserInput approval event only carries a call_id and question metadata.
+    let pending_mcp_invocations =
+        Arc::new(Mutex::new(HashMap::<String, PendingMcpInvocation>::new()));
+    let caller_io = SessionIo {
+        tx_sub: tx_ops,
+        rx_event: rx_sub,
+        agent_status: io.agent_status.clone(),
+        session_loop_termination: io.session_loop_termination.clone(),
+    };
+    let io_for_events = Arc::clone(&io);
     tokio::spawn(async move {
         forward_events(
-            codex_for_events,
+            io_for_events,
+            session_for_events,
             tx_sub,
             parent_session_clone,
             parent_ctx_clone,
@@ -121,18 +192,11 @@ pub(crate) async fn run_codex_thread_interactive(
     });
 
     // Forward ops from the caller to the sub-agent.
-    let codex_for_ops = Arc::clone(&codex);
     tokio::spawn(async move {
-        forward_ops(codex_for_ops, rx_ops, cancel_token_ops).await;
+        forward_ops(io, rx_ops, cancel_token_ops).await;
     });
 
-    Ok(Codex {
-        tx_sub: tx_ops,
-        rx_event: rx_sub,
-        agent_status: codex.agent_status.clone(),
-        session: Arc::clone(&codex.session),
-        session_loop_termination: codex.session_loop_termination.clone(),
-    })
+    Ok((session, caller_io))
 }
 
 /// Convenience wrapper for one-time use with an initial prompt.
@@ -142,7 +206,7 @@ pub(crate) async fn run_codex_thread_interactive(
 pub(crate) async fn run_codex_thread_one_shot(
     config: Config,
     auth_manager: Arc<AuthManager>,
-    models_manager: Arc<ModelsManager>,
+    models_manager: SharedModelsManager,
     input: Vec<UserInput>,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
@@ -150,11 +214,12 @@ pub(crate) async fn run_codex_thread_one_shot(
     subagent_source: SubAgentSource,
     final_output_json_schema: Option<Value>,
     initial_history: Option<InitialHistory>,
-) -> Result<Codex, CodexErr> {
+) -> Result<(Arc<Session>, SessionIo), CodexErr> {
     // Use a child token so we can stop the delegate after completion without
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
-    let io = run_codex_thread_interactive(
+    let parent_turn_id = parent_ctx.sub_id.clone();
+    let (session, io) = Box::pin(run_codex_thread_interactive(
         config,
         auth_manager,
         models_manager,
@@ -163,21 +228,29 @@ pub(crate) async fn run_codex_thread_one_shot(
         child_cancel.clone(),
         subagent_source,
         initial_history,
-    )
+        GitEnrichmentPolicy::Fresh,
+        codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+    ))
     .await?;
 
     // Send the initial input to kick off the one-shot turn.
-    io.submit(Op::UserInput {
-        items: input,
-        final_output_json_schema,
-    })
+    io.submit_with_trace(
+        Op::UserInput {
+            items: input,
+            final_output_json_schema,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        },
+        /*trace*/ None,
+        Some(parent_turn_id),
+    )
     .await?;
 
     // Bridge events so we can observe completion and shut down automatically.
     let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let ops_tx = io.tx_sub.clone();
     let agent_status = io.agent_status.clone();
-    let session = Arc::clone(&io.session);
     let session_loop_termination = io.session_loop_termination.clone();
     let io_for_bridge = io;
     tokio::spawn(async move {
@@ -192,7 +265,9 @@ pub(crate) async fn run_codex_thread_one_shot(
                     .send(Submission {
                         id: "shutdown".to_string(),
                         op: Op::Shutdown {},
+                        client_user_message_id: None,
                         trace: None,
+                        parent_turn_id: None,
                     })
                     .await;
                 child_cancel.cancel();
@@ -207,21 +282,24 @@ pub(crate) async fn run_codex_thread_one_shot(
     let (tx_closed, rx_closed) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     drop(rx_closed);
 
-    Ok(Codex {
-        rx_event: rx_bridge,
-        tx_sub: tx_closed,
-        agent_status,
+    Ok((
         session,
-        session_loop_termination,
-    })
+        SessionIo {
+            rx_event: rx_bridge,
+            tx_sub: tx_closed,
+            agent_status,
+            session_loop_termination,
+        },
+    ))
 }
 
 async fn forward_events(
-    codex: Arc<Codex>,
+    io: Arc<SessionIo>,
+    session: Arc<Session>,
     tx_sub: Sender<Event>,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
-    pending_mcp_invocations: Arc<Mutex<HashMap<String, McpInvocation>>>,
+    pending_mcp_invocations: Arc<Mutex<HashMap<String, PendingMcpInvocation>>>,
     cancel_token: CancellationToken,
 ) {
     let cancelled = cancel_token.cancelled();
@@ -230,31 +308,22 @@ async fn forward_events(
     loop {
         tokio::select! {
             _ = &mut cancelled => {
-                shutdown_delegate(&codex).await;
+                shutdown_delegate(&io).await;
                 break;
             }
-            event = codex.next_event() => {
+            event = io.next_event() => {
                 let event = match event {
                     Ok(event) => event,
                     Err(_) => break,
                 };
                 match event {
-                    // ignore all legacy delta events
                     Event {
                         id: _,
-                        msg: EventMsg::AgentMessageDelta(_) | EventMsg::AgentReasoningDelta(_),
-                    } => {}
-                    Event {
-                        id: _,
-                        msg: EventMsg::TokenCount(_),
-                    } => {}
-                    Event {
-                        id: _,
-                        msg: EventMsg::SessionConfigured(_),
-                    } => {}
-                    Event {
-                        id: _,
-                        msg: EventMsg::ThreadNameUpdated(_),
+                        msg:
+                            EventMsg::TokenCount(_)
+                            | EventMsg::SessionConfigured(_)
+                            | EventMsg::McpStartupUpdate(_)
+                            | EventMsg::McpStartupComplete(_),
                     } => {}
                     Event {
                         id,
@@ -262,7 +331,7 @@ async fn forward_events(
                     } => {
                         // Initiate approval via parent session; do not surface to consumer.
                         handle_exec_approval(
-                            &codex,
+                            &io,
                             id,
                             &parent_session,
                             &parent_ctx,
@@ -276,7 +345,7 @@ async fn forward_events(
                         msg: EventMsg::ApplyPatchApprovalRequest(event),
                     } => {
                         handle_patch_approval(
-                            &codex,
+                            &io,
                             id,
                             &parent_session,
                             &parent_ctx,
@@ -290,7 +359,7 @@ async fn forward_events(
                         ..
                     } => {
                         handle_request_permissions(
-                            &codex,
+                            &io,
                             &parent_session,
                             &parent_ctx,
                             event,
@@ -303,7 +372,7 @@ async fn forward_events(
                         msg: EventMsg::RequestUserInput(event),
                     } => {
                         handle_request_user_input(
-                            &codex,
+                            &io,
                             id,
                             &parent_session,
                             &parent_ctx,
@@ -317,12 +386,25 @@ async fn forward_events(
                         id,
                         msg: EventMsg::McpToolCallBegin(event),
                     } => {
+                        // The later approval event has only a call ID. Retain the exact facts
+                        // captured before this begin event instead of consulting the latest
+                        // runtime after a refresh.
+                        let metadata = session
+                            .mcp_tool_approval_metadata(&id, &event.call_id)
+                            .await
+                            .map(|(_, metadata)| metadata);
                         pending_mcp_invocations
                             .lock()
                             .await
-                            .insert(event.call_id.clone(), event.invocation.clone());
+                            .insert(
+                                event.call_id.clone(),
+                                PendingMcpInvocation {
+                                    invocation: event.invocation.clone(),
+                                    metadata,
+                                },
+                            );
                         if !forward_event_or_shutdown(
-                            &codex,
+                            &io,
                             &tx_sub,
                             &cancel_token,
                             Event {
@@ -341,7 +423,7 @@ async fn forward_events(
                     } => {
                         pending_mcp_invocations.lock().await.remove(&event.call_id);
                         if !forward_event_or_shutdown(
-                            &codex,
+                            &io,
                             &tx_sub,
                             &cancel_token,
                             Event {
@@ -355,7 +437,7 @@ async fn forward_events(
                         }
                     }
                     other => {
-                        if !forward_event_or_shutdown(&codex, &tx_sub, &cancel_token, other).await
+                        if !forward_event_or_shutdown(&io, &tx_sub, &cancel_token, other).await
                         {
                             break;
                         }
@@ -367,12 +449,12 @@ async fn forward_events(
 }
 
 /// Ask the delegate to stop and drain its events so background sends do not hit a closed channel.
-async fn shutdown_delegate(codex: &Codex) {
-    let _ = codex.submit(Op::Interrupt).await;
-    let _ = codex.submit(Op::Shutdown {}).await;
+async fn shutdown_delegate(io: &SessionIo) {
+    let _ = io.submit(Op::Interrupt).await;
+    let _ = io.submit(Op::Shutdown {}).await;
 
     let _ = timeout(Duration::from_millis(500), async {
-        while let Ok(event) = codex.next_event().await {
+        while let Ok(event) = io.next_event().await {
             if matches!(
                 event.msg,
                 EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
@@ -385,7 +467,7 @@ async fn shutdown_delegate(codex: &Codex) {
 }
 
 async fn forward_event_or_shutdown(
-    codex: &Codex,
+    io: &SessionIo,
     tx_sub: &Sender<Event>,
     cancel_token: &CancellationToken,
     event: Event,
@@ -393,7 +475,7 @@ async fn forward_event_or_shutdown(
     match tx_sub.send(event).or_cancel(cancel_token).await {
         Ok(Ok(())) => true,
         _ => {
-            shutdown_delegate(codex).await;
+            shutdown_delegate(io).await;
             false
         }
     }
@@ -401,7 +483,7 @@ async fn forward_event_or_shutdown(
 
 /// Forward ops from a caller to a sub-agent, respecting cancellation.
 async fn forward_ops(
-    codex: Arc<Codex>,
+    io: Arc<SessionIo>,
     rx_ops: Receiver<Submission>,
     cancel_token_ops: CancellationToken,
 ) {
@@ -410,13 +492,13 @@ async fn forward_ops(
             Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
-        let _ = codex.submit_with_id(submission).await;
+        let _ = io.submit_with_id(submission).await;
     }
 }
 
 /// Handle an ExecApprovalRequest by consulting the parent session and replying.
 async fn handle_exec_approval(
-    codex: &Codex,
+    io: &SessionIo,
     turn_id: String,
     parent_session: &Arc<Session>,
     parent_ctx: &Arc<TurnContext>,
@@ -426,22 +508,34 @@ async fn handle_exec_approval(
     let approval_id_for_op = event.effective_approval_id();
     let ExecApprovalRequestEvent {
         call_id,
+        plugin_id,
+        script_path,
         approval_id,
+        environment_id,
         command,
         cwd,
         reason,
         network_approval_context,
         proposed_execpolicy_amendment,
         additional_permissions,
-        skill_metadata,
         available_decisions,
         ..
     } = event;
+    let plugin_attribution = plugin_id
+        .zip(script_path)
+        .and_then(|(plugin_id, script_path)| {
+            let plugin_id = PluginId::parse(&plugin_id).ok()?;
+            is_safe_plugin_relative_path(&script_path).then_some(PluginCommandAttribution {
+                plugin_id,
+                normalized_relative_path: script_path,
+            })
+        });
     let decision = if routes_approval_to_guardian(parent_ctx) {
         let review_cancel = cancel_token.child_token();
-        let review_rx = spawn_guardian_review(
+        let review_rx = spawn_approval_request_review(
             Arc::clone(parent_session),
             Arc::clone(parent_ctx),
+            new_guardian_review_id(),
             GuardianApprovalRequest::Shell {
                 id: call_id.clone(),
                 command,
@@ -455,10 +549,14 @@ async fn handle_exec_approval(
                 justification: None,
             },
             reason,
-            review_cancel.clone(),
+            GuardianReviewOptions {
+                plugin_attribution_override: plugin_attribution.clone(),
+                approval_request_source: GuardianApprovalRequestSource::DelegatedSubagent,
+                external_cancel: Some(review_cancel.clone()),
+            },
         );
         await_approval_with_cancel(
-            async move { review_rx.await.unwrap_or_default() },
+            receive_approval_review(review_rx),
             parent_session,
             &approval_id_for_op,
             cancel_token,
@@ -471,14 +569,15 @@ async fn handle_exec_approval(
                 parent_ctx,
                 call_id,
                 approval_id,
+                environment_id,
                 command,
                 cwd,
                 reason,
                 network_approval_context,
                 proposed_execpolicy_amendment,
                 additional_permissions,
-                skill_metadata,
                 available_decisions,
+                plugin_attribution,
             ),
             parent_session,
             &approval_id_for_op,
@@ -488,7 +587,7 @@ async fn handle_exec_approval(
         .await
     };
 
-    let _ = codex
+    let _ = io
         .submit(Op::ExecApproval {
             id: approval_id_for_op,
             turn_id: Some(turn_id),
@@ -499,7 +598,7 @@ async fn handle_exec_approval(
 
 /// Handle an ApplyPatchApprovalRequest by consulting the parent session and replying.
 async fn handle_patch_approval(
-    codex: &Codex,
+    io: &SessionIo,
     _id: String,
     parent_session: &Arc<Session>,
     parent_ctx: &Arc<TurnContext>,
@@ -515,77 +614,79 @@ async fn handle_patch_approval(
     } = event;
     let approval_id = call_id.clone();
     let guardian_decision = if routes_approval_to_guardian(parent_ctx) {
-        let change_count = changes.len();
-        let maybe_files = changes
+        let files = changes
             .keys()
-            .map(|path| AbsolutePathBuf::from_absolute_path(parent_ctx.cwd.join(path)).ok())
-            .collect::<Option<Vec<_>>>();
-        if let Some(files) = maybe_files {
-            let review_cancel = cancel_token.child_token();
-            let patch = changes
-                .iter()
-                .map(|(path, change)| match change {
-                    codex_protocol::protocol::FileChange::Add { content } => {
-                        format!("*** Add File: {}\n{}", path.display(), content)
+            .map(|path| {
+                #[allow(deprecated)]
+                parent_ctx.cwd.join(path)
+            })
+            .collect::<Vec<_>>();
+        let review_cancel = cancel_token.child_token();
+        let patch = changes
+            .iter()
+            .map(|(path, change)| match change {
+                codex_protocol::protocol::FileChange::Add { content } => {
+                    format!("*** Add File: {}\n{}", path.display(), content)
+                }
+                codex_protocol::protocol::FileChange::Delete { content } => {
+                    format!("*** Delete File: {}\n{}", path.display(), content)
+                }
+                codex_protocol::protocol::FileChange::Update {
+                    unified_diff,
+                    move_path,
+                } => {
+                    if let Some(move_path) = move_path {
+                        format!(
+                            "*** Update File: {}\n*** Move to: {}\n{}",
+                            path.display(),
+                            move_path.display(),
+                            unified_diff
+                        )
+                    } else {
+                        format!("*** Update File: {}\n{}", path.display(), unified_diff)
                     }
-                    codex_protocol::protocol::FileChange::Delete { content } => {
-                        format!("*** Delete File: {}\n{}", path.display(), content)
-                    }
-                    codex_protocol::protocol::FileChange::Update {
-                        unified_diff,
-                        move_path,
-                    } => {
-                        if let Some(move_path) = move_path {
-                            format!(
-                                "*** Update File: {}\n*** Move to: {}\n{}",
-                                path.display(),
-                                move_path.display(),
-                                unified_diff
-                            )
-                        } else {
-                            format!("*** Update File: {}\n{}", path.display(), unified_diff)
-                        }
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let review_rx = spawn_guardian_review(
-                Arc::clone(parent_session),
-                Arc::clone(parent_ctx),
-                GuardianApprovalRequest::ApplyPatch {
-                    id: approval_id.clone(),
-                    cwd: parent_ctx.cwd.clone(),
-                    files,
-                    change_count,
-                    patch,
-                },
-                reason.clone(),
-                review_cancel.clone(),
-            );
-            Some(
-                await_approval_with_cancel(
-                    async move { review_rx.await.unwrap_or_default() },
-                    parent_session,
-                    &approval_id,
-                    cancel_token,
-                    Some(&review_cancel),
-                )
-                .await,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let review_rx = spawn_approval_request_review(
+            Arc::clone(parent_session),
+            Arc::clone(parent_ctx),
+            new_guardian_review_id(),
+            GuardianApprovalRequest::ApplyPatch {
+                id: approval_id.clone(),
+                #[allow(deprecated)]
+                cwd: parent_ctx.cwd.clone(),
+                files,
+                patch,
+            },
+            reason.clone(),
+            GuardianReviewOptions {
+                plugin_attribution_override: None,
+                approval_request_source: GuardianApprovalRequestSource::DelegatedSubagent,
+                external_cancel: Some(review_cancel.clone()),
+            },
+        );
+        Some(
+            await_approval_with_cancel(
+                receive_approval_review(review_rx),
+                parent_session,
+                &approval_id,
+                cancel_token,
+                Some(&review_cancel),
             )
-        } else {
-            None
-        }
+            .await,
+        )
     } else {
         None
     };
     let decision = if let Some(decision) = guardian_decision {
         decision
     } else {
-        let decision_rx = parent_session
-            .request_patch_approval(parent_ctx, call_id, changes, reason, grant_root)
-            .await;
+        let decision =
+            parent_session.request_patch_approval(parent_ctx, call_id, changes, reason, grant_root);
         await_approval_with_cancel(
-            async move { decision_rx.await.unwrap_or_default() },
+            decision,
             parent_session,
             &approval_id,
             cancel_token,
@@ -593,7 +694,7 @@ async fn handle_patch_approval(
         )
         .await
     };
-    let _ = codex
+    let _ = io
         .submit(Op::PatchApproval {
             id: approval_id,
             decision,
@@ -602,30 +703,31 @@ async fn handle_patch_approval(
 }
 
 async fn handle_request_user_input(
-    codex: &Codex,
+    io: &SessionIo,
     id: String,
     parent_session: &Arc<Session>,
     parent_ctx: &Arc<TurnContext>,
-    pending_mcp_invocations: &Arc<Mutex<HashMap<String, McpInvocation>>>,
+    pending_mcp_invocations: &Arc<Mutex<HashMap<String, PendingMcpInvocation>>>,
     event: RequestUserInputEvent,
     cancel_token: &CancellationToken,
 ) {
-    if routes_approval_to_guardian(parent_ctx)
-        && let Some(response) = maybe_auto_review_mcp_request_user_input(
-            parent_session,
-            parent_ctx,
-            pending_mcp_invocations,
-            &event,
-            cancel_token,
-        )
-        .await
+    if let Some(response) = maybe_auto_review_mcp_request_user_input(
+        parent_session,
+        parent_ctx,
+        pending_mcp_invocations,
+        &event,
+        cancel_token,
+    )
+    .await
     {
-        let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
+        let _ = io.submit(Op::UserInputAnswer { id, response }).await;
         return;
     }
 
     let args = RequestUserInputArgs {
         questions: event.questions,
+        is_blocking: event.is_blocking,
+        auto_resolution_ms: event.auto_resolution_ms,
     };
     let response_fut =
         parent_session.request_user_input(parent_ctx, parent_ctx.sub_id.clone(), args);
@@ -636,7 +738,7 @@ async fn handle_request_user_input(
         cancel_token,
     )
     .await;
-    let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
+    let _ = io.submit(Op::UserInputAnswer { id, response }).await;
 }
 
 /// Intercepts delegated legacy MCP approval prompts on the RequestUserInput
@@ -644,12 +746,12 @@ async fn handle_request_user_input(
 /// programmatically after running the guardian review.
 ///
 /// The RequestUserInput event only carries `call_id` plus approval question
-/// metadata, so this helper joins it back to the cached `McpToolCallBegin`
-/// invocation in order to rebuild the full guardian review request.
+/// metadata, so this helper joins it back to the child runtime metadata cached at
+/// `McpToolCallBegin` in order to rebuild the full guardian review request.
 async fn maybe_auto_review_mcp_request_user_input(
     parent_session: &Arc<Session>,
     parent_ctx: &Arc<TurnContext>,
-    pending_mcp_invocations: &Arc<Mutex<HashMap<String, McpInvocation>>>,
+    pending_mcp_invocations: &Arc<Mutex<HashMap<String, PendingMcpInvocation>>>,
     event: &RequestUserInputEvent,
     cancel_token: &CancellationToken,
 ) -> Option<RequestUserInputResponse> {
@@ -660,28 +762,33 @@ async fn maybe_auto_review_mcp_request_user_input(
         .questions
         .iter()
         .find(|question| is_mcp_tool_approval_question_id(&question.id))?;
-    let invocation = pending_mcp_invocations
+    let pending = pending_mcp_invocations
         .lock()
         .await
         .get(&event.call_id)
         .cloned()?;
-    let metadata = lookup_mcp_tool_metadata(
-        parent_session.as_ref(),
-        parent_ctx.as_ref(),
-        &invocation.server,
-        &invocation.tool,
-    )
-    .await;
+    let invocation = pending.invocation;
+    let metadata = pending.metadata;
+    let approvals_reviewer =
+        mcp_approvals_reviewer(parent_ctx, &invocation.server, metadata.as_ref());
+    if !routes_approval_to_guardian_with_reviewer(parent_ctx, approvals_reviewer) {
+        return None;
+    }
     let review_cancel = cancel_token.child_token();
-    let review_rx = spawn_guardian_review(
+    let review_rx = spawn_approval_request_review(
         Arc::clone(parent_session),
         Arc::clone(parent_ctx),
+        new_guardian_review_id(),
         build_guardian_mcp_tool_review_request(&event.call_id, &invocation, metadata.as_ref()),
         /*retry_reason*/ None,
-        review_cancel.clone(),
+        GuardianReviewOptions {
+            plugin_attribution_override: None,
+            approval_request_source: GuardianApprovalRequestSource::DelegatedSubagent,
+            external_cancel: Some(review_cancel.clone()),
+        },
     );
     let decision = await_approval_with_cancel(
-        async move { review_rx.await.unwrap_or_default() },
+        receive_approval_review(review_rx),
         parent_session,
         &event.call_id,
         cancel_token,
@@ -702,7 +809,7 @@ async fn maybe_auto_review_mcp_request_user_input(
         ReviewDecision::Approved
         | ReviewDecision::ApprovedExecpolicyAmendment { .. }
         | ReviewDecision::NetworkPolicyAmendment { .. } => MCP_TOOL_APPROVAL_ACCEPT.to_string(),
-        ReviewDecision::Denied | ReviewDecision::Abort => {
+        ReviewDecision::Denied { .. } | ReviewDecision::TimedOut | ReviewDecision::Abort => {
             MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC.to_string()
         }
     };
@@ -716,36 +823,8 @@ async fn maybe_auto_review_mcp_request_user_input(
     })
 }
 
-fn spawn_guardian_review(
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
-    request: GuardianApprovalRequest,
-    retry_reason: Option<String>,
-    cancel_token: CancellationToken,
-) -> oneshot::Receiver<ReviewDecision> {
-    let (tx, rx) = oneshot::channel();
-    std::thread::spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            let _ = tx.send(ReviewDecision::Denied);
-            return;
-        };
-        let decision = runtime.block_on(review_approval_request_with_cancel(
-            &session,
-            &turn,
-            request,
-            retry_reason,
-            cancel_token,
-        ));
-        let _ = tx.send(decision);
-    });
-    rx
-}
-
 async fn handle_request_permissions(
-    codex: &Codex,
+    io: &SessionIo,
     parent_session: &Arc<Session>,
     parent_ctx: &Arc<TurnContext>,
     event: RequestPermissionsEvent,
@@ -753,14 +832,25 @@ async fn handle_request_permissions(
 ) {
     let call_id = event.call_id;
     let args = RequestPermissionsArgs {
+        environment_id: event.environment_id,
         reason: event.reason,
         permissions: event.permissions,
     };
-    let response_fut = parent_session.request_permissions(parent_ctx, call_id.clone(), args);
+    let cwd = event.cwd.unwrap_or_else(|| {
+        #[allow(deprecated)]
+        parent_ctx.cwd.clone()
+    });
+    let response_fut = parent_session.request_permissions_for_cwd(
+        parent_ctx,
+        call_id.clone(),
+        args,
+        cwd,
+        cancel_token.clone(),
+    );
     let response =
         await_request_permissions_with_cancel(response_fut, parent_session, &call_id, cancel_token)
             .await;
-    let _ = codex
+    let _ = io
         .submit(Op::RequestPermissionsResponse {
             id: call_id,
             response,
@@ -809,6 +899,7 @@ where
             let empty = RequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             };
             parent_session
                 .notify_request_permissions_response(call_id, empty.clone())
@@ -818,8 +909,15 @@ where
         response = fut => response.unwrap_or_else(|| RequestPermissionsResponse {
             permissions: Default::default(),
             scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
         }),
     }
+}
+
+async fn receive_approval_review(review_rx: oneshot::Receiver<ReviewDecision>) -> ReviewDecision {
+    review_rx
+        .await
+        .unwrap_or_else(|_| ReviewDecision::denied("automatic approval review could not complete"))
 }
 
 /// Await an approval decision, aborting on cancellation.
@@ -840,7 +938,10 @@ where
                 review_cancel_token.cancel();
             }
             parent_session
-                .notify_approval(approval_id, codex_protocol::protocol::ReviewDecision::Abort)
+                .notify_approval(
+                    approval_id,
+                    codex_protocol::protocol::ReviewDecision::Abort,
+                )
                 .await;
             codex_protocol::protocol::ReviewDecision::Abort
         }

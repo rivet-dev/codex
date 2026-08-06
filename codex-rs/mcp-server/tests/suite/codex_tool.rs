@@ -3,6 +3,9 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
+use app_test_support::ChatGptAuthFixture;
+use app_test_support::write_chatgpt_auth;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
 use codex_mcp_server::CodexToolCallParam;
 use codex_mcp_server::ExecApprovalElicitRequestParams;
@@ -19,7 +22,11 @@ use rmcp::model::RequestId;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::timeout;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 use core_test_support::skip_if_no_network;
 use mcp_test_support::McpProcess;
@@ -29,8 +36,9 @@ use mcp_test_support::create_mock_responses_server;
 use mcp_test_support::create_shell_command_sse_response;
 use mcp_test_support::format_with_current_shell;
 
-// Allow ample time on slower CI or under load to avoid flakes.
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+// Windows CI can spend tens of seconds in session startup before the first
+// mock model request is sent.
+const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Test that a shell command that is not on the "trusted" list triggers an
 /// elicitation request to the MCP and that sending the approval runs the
@@ -46,9 +54,9 @@ async fn test_shell_command_approval_triggers_elicitation() {
 
     // Apparently `#[tokio::test]` must return `()`, so we create a helper
     // function that returns `Result` so we can use `?` in favor of `unwrap`.
-    if let Err(err) = shell_command_approval_triggers_elicitation().await {
-        panic!("failure: {err}");
-    }
+    shell_command_approval_triggers_elicitation()
+        .await
+        .expect("shell command approval should trigger elicitation");
 }
 
 async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
@@ -60,17 +68,24 @@ async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
         .path()
         .join(created_filename);
 
-    let shell_command = if cfg!(windows) {
-        vec![
-            "New-Item".to_string(),
-            "-ItemType".to_string(),
-            "File".to_string(),
-            "-Path".to_string(),
-            created_filename.to_string(),
-            "-Force".to_string(),
-        ]
+    let (shell_command, timeout_ms) = if cfg!(windows) {
+        (
+            vec![
+                "New-Item".to_string(),
+                "-ItemType".to_string(),
+                "File".to_string(),
+                "-Path".to_string(),
+                created_filename.to_string(),
+                "-Force".to_string(),
+            ],
+            // `powershell.exe` startup can be slow on loaded Windows CI workers
+            10_000,
+        )
     } else {
-        vec!["touch".to_string(), created_filename.to_string()]
+        (
+            vec!["touch".to_string(), created_filename.to_string()],
+            5_000,
+        )
     };
     let expected_shell_command =
         format_with_current_shell(&shlex::try_join(shell_command.iter().map(String::as_str))?);
@@ -83,7 +98,7 @@ async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
         create_shell_command_sse_response(
             shell_command.clone(),
             Some(workdir_for_shell_function_call.path()),
-            Some(5_000),
+            Some(timeout_ms),
             "call1234",
         )?,
         create_final_assistant_message_sse_response("File created!")?,
@@ -138,7 +153,6 @@ async fn shell_command_approval_triggers_elicitation() -> anyhow::Result<()> {
         .await?;
 
     // Verify task_complete notification arrives before the tool call completes.
-    #[expect(clippy::expect_used)]
     let _task_complete = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp_process.read_stream_until_legacy_task_complete_notification(),
@@ -217,9 +231,9 @@ async fn test_patch_approval_triggers_elicitation() {
         return;
     }
 
-    if let Err(err) = patch_approval_triggers_elicitation().await {
-        panic!("failure: {err}");
-    }
+    patch_approval_triggers_elicitation()
+        .await
+        .expect("patch approval should trigger elicitation");
 }
 
 async fn patch_approval_triggers_elicitation() -> anyhow::Result<()> {
@@ -253,6 +267,11 @@ async fn patch_approval_triggers_elicitation() -> anyhow::Result<()> {
         .send_codex_tool_call(CodexToolCallParam {
             cwd: Some(cwd.path().to_string_lossy().to_string()),
             prompt: "please modify the test file".to_string(),
+            // This test exercises patch approval elicitation, not local sandbox setup.
+            config: Some(HashMap::from([(
+                "sandbox_mode".to_string(),
+                json!("danger-full-access"),
+            )])),
             ..Default::default()
         })
         .await?;
@@ -287,8 +306,8 @@ async fn patch_approval_triggers_elicitation() -> anyhow::Result<()> {
         elicitation_request.request.params,
         Some(create_expected_patch_approval_elicitation_request_params(
             expected_changes,
-            None, // No grant_root expected
-            None, // No reason expected
+            /*grant_root*/ None, // No grant_root expected
+            /*reason*/ None,
             codex_request_id.to_string(),
             params.codex_event_id.clone(),
             params.thread_id,
@@ -343,28 +362,56 @@ async fn test_codex_tool_passes_base_instructions() {
 
     // Apparently `#[tokio::test]` must return `()`, so we create a helper
     // function that returns `Result` so we can use `?` in favor of `unwrap`.
-    if let Err(err) = codex_tool_passes_base_instructions().await {
-        panic!("failure: {err}");
-    }
+    codex_tool_passes_base_instructions()
+        .await
+        .expect("codex tool should pass base instructions");
 }
 
 async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
-    #![expect(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::unwrap_used)]
 
     let server =
         create_mock_responses_server(vec![create_final_assistant_message_sse_response("Enjoy!")?])
             .await;
+    let caller_server = MockServer::start().await;
 
     // Run `codex mcp` with a specific config.toml.
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
-    let mut mcp_process = McpProcess::new(codex_home.path()).await?;
+    let skill_dir = codex_home.path().join("skills").join("demo");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo skill.\n---\n# Demo\n\nUse this skill.\n",
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token").account_id("workspace-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/settings/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "commit_attribution_enabled": true,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut mcp_process = McpProcess::new_with_env(
+        codex_home.path(),
+        &[("OPENAI_API_KEY", None), ("CODEX_ACCESS_TOKEN", None)],
+    )
+    .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp_process.initialize()).await??;
 
     // Send a "codex" tool request, which should hit the responses endpoint.
     let codex_request_id = mcp_process
         .send_codex_tool_call(CodexToolCallParam {
             prompt: "How are you?".to_string(),
+            config: Some(HashMap::from([(
+                "chatgpt_base_url".to_string(),
+                json!(format!("{}/backend-api", caller_server.uri())),
+            )])),
             base_instructions: Some("You are a helpful assistant.".to_string()),
             developer_instructions: Some("Foreshadow upcoming tool calls.".to_string()),
             ..Default::default()
@@ -400,12 +447,15 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
     );
 
     let requests = server.received_requests().await.unwrap();
-    let request = requests[0].body_json::<serde_json::Value>()?;
+    let request = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/responses")
+        .expect("mock model request should be recorded")
+        .body_json::<serde_json::Value>()?;
     let instructions = request["instructions"]
         .as_str()
         .expect("responses request should include instructions");
     assert!(instructions.starts_with("You are a helpful assistant."));
-
     let developer_messages: Vec<&serde_json::Value> = request["input"]
         .as_array()
         .expect("responses request should include input items")
@@ -419,6 +469,19 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
         .filter(|span| span.get("type").and_then(serde_json::Value::as_str) == Some("input_text"))
         .filter_map(|span| span.get("text").and_then(serde_json::Value::as_str))
         .collect();
+    let developer_text = developer_contents.join("\n");
+    assert_eq!(
+        developer_text
+            .matches("Co-authored-by: Codex <noreply@openai.com>")
+            .count(),
+        1
+    );
+    assert_eq!(developer_text.matches("Generated with Codex.").count(), 1);
+    assert_eq!(
+        developer_text.matches("- demo: Demo skill.").count(),
+        1,
+        "host skill catalog should be included exactly once"
+    );
     assert!(
         developer_contents
             .iter()
@@ -429,6 +492,90 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
         developer_contents.contains(&"Foreshadow upcoming tool calls."),
         "expected developer instructions in developer messages, got {developer_contents:?}"
     );
+    let caller_requests = caller_server.received_requests().await.unwrap();
+    assert!(
+        caller_requests
+            .iter()
+            .all(|request| request.url.path() != "/backend-api/wham/settings/user"),
+        "attribution settings must use the process-level base URL"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_codex_tool_forwards_skills_extension_warnings() {
+    skip_if_no_network!();
+
+    codex_tool_forwards_skills_extension_warnings()
+        .await
+        .expect("codex tool should forward skills extension warnings");
+}
+
+async fn codex_tool_forwards_skills_extension_warnings() -> anyhow::Result<()> {
+    let server =
+        create_mock_responses_server(vec![create_final_assistant_message_sse_response("Enjoy!")?])
+            .await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let skills_dir = codex_home.path().join("skills");
+    for index in 0..200 {
+        let name = format!("skill-{index:03}");
+        let skill_dir = skills_dir.join(&name);
+        std::fs::create_dir_all(&skill_dir)?;
+        let description = format!("Skill {index}: {}", "x".repeat(200));
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: {description}\n---\n# {name}\n\nUse this skill.\n"
+            ),
+        )?;
+    }
+    let mut mcp_process = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp_process.initialize()).await??;
+
+    let codex_request_id = mcp_process
+        .send_codex_tool_call(CodexToolCallParam {
+            prompt: "How are you?".to_string(),
+            ..Default::default()
+        })
+        .await?;
+
+    let warning = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_codex_event_matching("warning", |params| {
+            params["msg"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("skills context budget"))
+        }),
+    )
+    .await??;
+    let warning_json = serde_json::to_value(&warning)?;
+    let params = warning
+        .notification
+        .params
+        .ok_or_else(|| anyhow::anyhow!("warning notification should include params"))?;
+    assert_eq!(
+        warning_json["params"]["_meta"]["requestId"],
+        codex_request_id
+    );
+    assert_eq!(warning_json["params"]["id"], codex_request_id.to_string());
+    assert!(
+        warning_json["params"]["_meta"]["threadId"]
+            .as_str()
+            .is_some_and(|thread_id| !thread_id.is_empty())
+    );
+    assert_eq!(params["msg"]["type"], "warning");
+    assert!(
+        params["msg"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("skills context budget"))
+    );
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_response_message(RequestId::Number(codex_request_id)),
+    )
+    .await??;
 
     Ok(())
 }
@@ -501,6 +648,8 @@ approval_policy = "untrusted"
 sandbox_policy = "workspace-write"
 
 model_provider = "mock_provider"
+chatgpt_base_url = "{server_uri}/backend-api"
+cli_auth_credentials_store = "file"
 
 [model_providers.mock_provider]
 name = "Mock provider for test"

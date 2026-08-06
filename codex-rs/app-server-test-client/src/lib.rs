@@ -46,9 +46,9 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
+use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
-use codex_app_server_protocol::ReadOnlyAccess;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
@@ -71,6 +71,7 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::config::Config;
 use codex_otel::OtelProvider;
 use codex_otel::current_span_w3c_trace_context;
+use codex_protocol::dynamic_tools::normalize_dynamic_tool_specs;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_utils_cli::CliConfigOverrides;
@@ -86,6 +87,12 @@ use tungstenite::connect;
 use tungstenite::stream::MaybeTlsStream;
 use url::Url;
 use uuid::Uuid;
+
+mod loopback_responses_server;
+mod plugin_analytics_capture;
+mod plugin_analytics_mutation_smoke;
+mod plugin_analytics_smoke;
+mod request_user_input;
 
 const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
     // v2 item deltas.
@@ -136,7 +143,7 @@ struct Cli {
     /// Prefix a filename with '@' to read from a file.
     ///
     /// Example:
-    ///   --dynamic-tools '[{"name":"demo","description":"Demo","inputSchema":{"type":"object"}}]'
+    ///   --dynamic-tools '[{"type":"function","name":"demo","description":"Demo","inputSchema":{"type":"object"}}]'
     ///   --dynamic-tools @/path/to/tools.json
     #[arg(long, value_name = "json-or-@file", global = true)]
     dynamic_tools: Option<String>,
@@ -224,8 +231,23 @@ enum CliCommand {
         #[arg(long)]
         abort_on: Option<usize>,
     },
-    /// Trigger the ChatGPT login flow and wait for completion.
-    TestLogin,
+    /// Trigger a ChatGPT or Amazon Bedrock login flow.
+    TestLogin {
+        /// Use the device-code login flow instead of the browser callback flow.
+        #[arg(long, default_value_t = false, conflicts_with = "amazon_bedrock")]
+        device_code: bool,
+        /// Use a Codex-managed Amazon Bedrock API key.
+        #[arg(long, default_value_t = false, conflicts_with = "device_code")]
+        amazon_bedrock: bool,
+        /// Amazon Bedrock API key.
+        #[arg(long, value_name = "API_KEY")]
+        api_key: Option<String>,
+        /// AWS Region for the Amazon Bedrock Mantle endpoint.
+        #[arg(long, value_name = "REGION")]
+        region: Option<String>,
+    },
+    /// Log out of the current account and wait for the account update.
+    TestLogout,
     /// Fetch the current account rate limits from the Codex app-server.
     GetAccountRateLimits,
     /// List the available models from the Codex app-server.
@@ -268,6 +290,45 @@ enum CliCommand {
         #[arg(long, default_value_t = 15)]
         hold_seconds: u64,
     },
+    /// Exercise remote plugin analytics through production app-server RPC paths.
+    #[command(name = "plugin-analytics-smoke")]
+    PluginAnalyticsSmoke {
+        /// Installed local plugin id, such as `linear@openai-curated-remote`.
+        #[arg(long)]
+        plugin_id: String,
+        /// JSONL output path. Defaults to a PID-specific file under the system temp directory.
+        #[arg(long)]
+        capture_file: Option<PathBuf>,
+    },
+    /// Install and uninstall one remote plugin while validating analytics capture.
+    #[command(name = "plugin-analytics-mutation-smoke")]
+    PluginAnalyticsMutationSmoke {
+        /// Backend remote plugin id. The plugin must be initially uninstalled.
+        #[arg(long)]
+        remote_plugin_id: String,
+        /// Acknowledge that this command mutates the active account's plugin state.
+        #[arg(long)]
+        confirm_account_mutation: bool,
+        /// JSONL output path. Defaults to a PID-specific file under the system temp directory.
+        #[arg(long)]
+        capture_file: Option<PathBuf>,
+    },
+    /// Best-effort recovery command that uninstalls one remote plugin.
+    #[command(name = "plugin-remote-uninstall")]
+    PluginRemoteUninstall {
+        /// Backend remote plugin id to uninstall.
+        #[arg(long)]
+        remote_plugin_id: String,
+        /// Acknowledge that this command mutates the active account's plugin state.
+        #[arg(long)]
+        confirm_account_mutation: bool,
+    },
+}
+
+enum TestLoginMode {
+    ChatgptBrowser,
+    ChatgptDeviceCode,
+    AmazonBedrock { api_key: String, region: String },
 }
 
 pub async fn run() -> Result<()> {
@@ -372,10 +433,29 @@ pub async fn run() -> Result<()> {
             )
             .await
         }
-        CliCommand::TestLogin => {
+        CliCommand::TestLogin {
+            device_code,
+            amazon_bedrock,
+            api_key,
+            region,
+        } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "test-login")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
-            test_login(&endpoint, &config_overrides).await
+            let mode = if amazon_bedrock {
+                let api_key = api_key.context("--api-key is required with --amazon-bedrock")?;
+                let region = region.context("--region is required with --amazon-bedrock")?;
+                TestLoginMode::AmazonBedrock { api_key, region }
+            } else if device_code {
+                TestLoginMode::ChatgptDeviceCode
+            } else {
+                TestLoginMode::ChatgptBrowser
+            };
+            test_login(&endpoint, &config_overrides, mode).await
+        }
+        CliCommand::TestLogout => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "test-logout")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            test_logout(&endpoint, &config_overrides).await
         }
         CliCommand::GetAccountRateLimits => {
             ensure_dynamic_tools_unused(&dynamic_tools, "get-account-rate-limits")?;
@@ -417,6 +497,58 @@ pub async fn run() -> Result<()> {
                 workspace,
                 script,
                 hold_seconds,
+            )
+        }
+        CliCommand::PluginAnalyticsSmoke {
+            plugin_id,
+            capture_file,
+        } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "plugin-analytics-smoke")?;
+            if url.is_some() {
+                bail!("plugin-analytics-smoke requires --codex-bin and does not support --url");
+            }
+            let codex_bin = codex_bin.context("plugin-analytics-smoke requires --codex-bin")?;
+            plugin_analytics_smoke::run(&codex_bin, &config_overrides, &plugin_id, capture_file)
+        }
+        CliCommand::PluginAnalyticsMutationSmoke {
+            remote_plugin_id,
+            confirm_account_mutation,
+            capture_file,
+        } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "plugin-analytics-mutation-smoke")?;
+            if url.is_some() {
+                bail!(
+                    "plugin-analytics-mutation-smoke requires --codex-bin and does not support --url"
+                );
+            }
+            let codex_bin =
+                codex_bin.context("plugin-analytics-mutation-smoke requires --codex-bin")?;
+            plugin_analytics_mutation_smoke::run(
+                &codex_bin,
+                &config_overrides,
+                &remote_plugin_id,
+                plugin_analytics_mutation_smoke::AccountMutationConfirmation::from_flag(
+                    confirm_account_mutation,
+                ),
+                capture_file,
+            )
+        }
+        CliCommand::PluginRemoteUninstall {
+            remote_plugin_id,
+            confirm_account_mutation,
+        } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "plugin-remote-uninstall")?;
+            if url.is_some() {
+                bail!("plugin-remote-uninstall requires --codex-bin and does not support --url");
+            }
+            let codex_bin = codex_bin.context("plugin-remote-uninstall requires --codex-bin")?;
+            plugin_analytics_mutation_smoke::run_cleanup(
+                &codex_bin,
+                &config_overrides,
+                &remote_plugin_id,
+                plugin_analytics_mutation_smoke::AccountMutationConfirmation::from_flag(
+                    confirm_account_mutation,
+                ),
             )
         }
     }
@@ -731,6 +863,7 @@ async fn trigger_zsh_fork_multi_cmd_approval(
 
             let mut turn_params = TurnStartParams {
                 thread_id: thread_response.thread.id.clone(),
+                client_user_message_id: None,
                 input: vec![V2UserInput::Text {
                     text: message,
                     text_elements: Vec::new(),
@@ -739,7 +872,6 @@ async fn trigger_zsh_fork_multi_cmd_approval(
             };
             turn_params.approval_policy = Some(AskForApproval::OnRequest);
             turn_params.sandbox_policy = Some(SandboxPolicy::ReadOnly {
-                access: ReadOnlyAccess::FullAccess,
                 network_access: false,
             });
 
@@ -816,6 +948,7 @@ async fn resume_message_v2(
 
         let turn_response = client.turn_start(TurnStartParams {
             thread_id: resume_response.thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: user_message,
                 text_elements: Vec::new(),
@@ -881,7 +1014,6 @@ async fn trigger_cmd_approval(
             experimental_api: true,
             approval_policy: Some(AskForApproval::OnRequest),
             sandbox_policy: Some(SandboxPolicy::ReadOnly {
-                access: ReadOnlyAccess::FullAccess,
                 network_access: false,
             }),
             dynamic_tools,
@@ -908,7 +1040,6 @@ async fn trigger_patch_approval(
             experimental_api: true,
             approval_policy: Some(AskForApproval::OnRequest),
             sandbox_policy: Some(SandboxPolicy::ReadOnly {
-                access: ReadOnlyAccess::FullAccess,
                 network_access: false,
             }),
             dynamic_tools,
@@ -959,6 +1090,7 @@ async fn send_message_v2_with_policies(
             println!("< thread/start response: {thread_response:?}");
             let mut turn_params = TurnStartParams {
                 thread_id: thread_response.thread.id.clone(),
+                client_user_message_id: None,
                 input: vec![V2UserInput::Text {
                     text: user_message,
                     // Test client sends plain text without UI element ranges.
@@ -999,6 +1131,7 @@ async fn send_follow_up_v2(
 
         let first_turn_params = TurnStartParams {
             thread_id: thread_response.thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: first_message,
                 // Test client sends plain text without UI element ranges.
@@ -1012,6 +1145,7 @@ async fn send_follow_up_v2(
 
         let follow_up_params = TurnStartParams {
             thread_id: thread_response.thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: follow_up_message,
                 // Test client sends plain text without UI element ranges.
@@ -1028,19 +1162,69 @@ async fn send_follow_up_v2(
     .await
 }
 
-async fn test_login(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()> {
+async fn test_login(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    mode: TestLoginMode,
+) -> Result<()> {
     with_client("test-login", endpoint, config_overrides, |client| {
         let initialize = client.initialize()?;
         println!("< initialize response: {initialize:?}");
 
-        let login_response = client.login_account_chatgpt()?;
-        println!("< account/login/start response: {login_response:?}");
-        let LoginAccountResponse::Chatgpt { login_id, auth_url } = login_response else {
-            bail!("expected chatgpt login response");
-        };
-        println!("Open the following URL in your browser to continue:\n{auth_url}");
+        let login_response = match mode {
+            TestLoginMode::ChatgptBrowser => client.login_account_chatgpt()?,
+            TestLoginMode::ChatgptDeviceCode => client.login_account_chatgpt_device_code()?,
+            TestLoginMode::AmazonBedrock { api_key, region } => {
+                let request_id = client.request_id();
+                let login_response: LoginAccountResponse = client.send_request(
+                    ClientRequest::LoginAccount {
+                        request_id: request_id.clone(),
+                        params: codex_app_server_protocol::LoginAccountParams::AmazonBedrock {
+                            api_key,
+                            region,
+                        },
+                    },
+                    request_id,
+                    "account/login/start",
+                )?;
+                println!("< account/login/start response: {login_response:?}");
 
-        let completion = client.wait_for_account_login_completion(&login_id)?;
+                let completion =
+                    client.wait_for_account_login_completion(/*expected_login_id*/ None)?;
+                println!("< account/login/completed notification: {completion:?}");
+
+                loop {
+                    let notification = client.next_notification()?;
+                    if let Ok(ServerNotification::AccountUpdated(account_updated)) =
+                        ServerNotification::try_from(notification)
+                    {
+                        println!("< account/updated notification: {account_updated:?}");
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+        };
+        println!("< account/login/start response: {login_response:?}");
+        let login_id = match login_response {
+            LoginAccountResponse::Chatgpt { login_id, auth_url } => {
+                println!("Open the following URL in your browser to continue:\n{auth_url}");
+                login_id
+            }
+            LoginAccountResponse::ChatgptDeviceCode {
+                login_id,
+                verification_url,
+                user_code,
+            } => {
+                println!(
+                    "Open the following URL and enter the code to continue:\n{verification_url}\n\nCode: {user_code}"
+                );
+                login_id
+            }
+            _ => bail!("expected chatgpt login response"),
+        };
+
+        let completion = client.wait_for_account_login_completion(Some(&login_id))?;
         println!("< account/login/completed notification: {completion:?}");
 
         if completion.success {
@@ -1077,6 +1261,27 @@ async fn get_account_rate_limits(endpoint: &Endpoint, config_overrides: &[String
     .await
 }
 
+async fn test_logout(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()> {
+    with_client("test-logout", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let response = client.logout_account()?;
+        println!("< account/logout response: {response:?}");
+
+        loop {
+            let notification = client.next_notification()?;
+            if let Ok(ServerNotification::AccountUpdated(account_updated)) =
+                ServerNotification::try_from(notification)
+            {
+                println!("< account/updated notification: {account_updated:?}");
+                return Ok(());
+            }
+        }
+    })
+    .await
+}
+
 async fn model_list(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()> {
     with_client("model-list", endpoint, config_overrides, |client| {
         let initialize = client.initialize()?;
@@ -1099,10 +1304,15 @@ async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u3
             cursor: None,
             limit: Some(limit),
             sort_key: None,
+            sort_direction: None,
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            parent_thread_id: None,
+            ancestor_thread_id: None,
             cwd: None,
+            use_state_db_only: false,
             search_term: None,
         })?;
         println!("< thread/list response: {response:?}");
@@ -1232,6 +1442,7 @@ fn live_elicitation_timeout_pause(
     let started_at = Instant::now();
     let turn_response = client.turn_start(TurnStartParams {
         thread_id: thread_id.clone(),
+        client_user_message_id: None,
         input: vec![V2UserInput::Text {
             text: prompt,
             text_elements: Vec::new(),
@@ -1343,11 +1554,12 @@ fn parse_dynamic_tools_arg(dynamic_tools: &Option<String>) -> Result<Option<Vec<
     };
 
     let value: Value = serde_json::from_str(&raw_json).context("parse dynamic tools JSON")?;
-    let tools = match value {
-        Value::Array(_) => serde_json::from_value(value).context("decode dynamic tools array")?,
-        Value::Object(_) => vec![serde_json::from_value(value).context("decode dynamic tool")?],
+    let values = match value {
+        Value::Array(values) => values,
+        Value::Object(_) => vec![value],
         _ => bail!("dynamic tools JSON must be an object or array"),
     };
+    let tools = normalize_dynamic_tool_specs(values).context("decode dynamic tools")?;
 
     Ok(Some(tools))
 }
@@ -1408,6 +1620,14 @@ impl CodexClient {
     }
 
     fn spawn_stdio(codex_bin: &Path, config_overrides: &[String]) -> Result<Self> {
+        Self::spawn_stdio_with_env(codex_bin, config_overrides, &[])
+    }
+
+    fn spawn_stdio_with_env(
+        codex_bin: &Path,
+        config_overrides: &[String],
+        environment: &[(OsString, OsString)],
+    ) -> Result<Self> {
         let codex_bin_display = codex_bin.display();
         let mut cmd = Command::new(codex_bin);
         if let Some(codex_bin_parent) = codex_bin.parent() {
@@ -1420,6 +1640,9 @@ impl CodexClient {
         }
         for override_kv in config_overrides {
             cmd.arg("--config").arg(override_kv);
+        }
+        for (name, value) in environment {
+            cmd.env(name, value);
         }
         let mut codex_app_server = cmd
             .arg("app-server")
@@ -1528,12 +1751,14 @@ impl CodexClient {
                 },
                 capabilities: Some(InitializeCapabilities {
                     experimental_api,
+                    request_attestation: false,
                     opt_out_notification_methods: Some(
                         NOTIFICATIONS_TO_OPT_OUT
                             .iter()
                             .map(|method| (*method).to_string())
                             .collect(),
                     ),
+                    mcp_server_openai_form_elicitation: false,
                 }),
             },
         };
@@ -1584,7 +1809,21 @@ impl CodexClient {
         let request_id = self.request_id();
         let request = ClientRequest::LoginAccount {
             request_id: request_id.clone(),
-            params: codex_app_server_protocol::LoginAccountParams::Chatgpt,
+            params: codex_app_server_protocol::LoginAccountParams::Chatgpt {
+                app_brand: None,
+                codex_streamlined_login: false,
+                use_hosted_login_success_page: false,
+            },
+        };
+
+        self.send_request(request, request_id, "account/login/start")
+    }
+
+    fn login_account_chatgpt_device_code(&mut self) -> Result<LoginAccountResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::LoginAccount {
+            request_id: request_id.clone(),
+            params: codex_app_server_protocol::LoginAccountParams::ChatgptDeviceCode,
         };
 
         self.send_request(request, request_id, "account/login/start")
@@ -1598,6 +1837,16 @@ impl CodexClient {
         };
 
         self.send_request(request, request_id, "account/rateLimits/read")
+    }
+
+    fn logout_account(&mut self) -> Result<LogoutAccountResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::LogoutAccount {
+            request_id: request_id.clone(),
+            params: None,
+        };
+
+        self.send_request(request, request_id, "account/logout")
     }
 
     fn model_list(&mut self, params: ModelListParams) -> Result<ModelListResponse> {
@@ -1648,7 +1897,7 @@ impl CodexClient {
 
     fn wait_for_account_login_completion(
         &mut self,
-        expected_login_id: &str,
+        expected_login_id: Option<&str>,
     ) -> Result<AccountLoginCompletedNotification> {
         loop {
             let notification = self.next_notification()?;
@@ -1656,7 +1905,7 @@ impl CodexClient {
             if let Ok(server_notification) = ServerNotification::try_from(notification) {
                 match server_notification {
                     ServerNotification::AccountLoginCompleted(completion) => {
-                        if completion.login_id.as_deref() == Some(expected_login_id) {
+                        if completion.login_id.as_deref() == expected_login_id {
                             return Ok(completion);
                         }
 
@@ -1805,7 +2054,13 @@ impl CodexClient {
             .context("client request was not a valid JSON-RPC request")?;
         request.trace = current_span_w3c_trace_context();
         let request_json = serde_json::to_string(&request)?;
-        let request_pretty = serde_json::to_string_pretty(&request)?;
+        let mut request_for_logging = serde_json::to_value(&request)?;
+        if request.method == "account/login/start"
+            && let Some(api_key) = request_for_logging.pointer_mut("/params/apiKey")
+        {
+            *api_key = Value::String("<redacted>".to_string());
+        }
+        let request_pretty = serde_json::to_string_pretty(&request_for_logging)?;
         print_multiline_with_prefix("> ", &request_pretty);
         self.write_payload(&request_json)
     }
@@ -1893,6 +2148,10 @@ impl CodexClient {
             ServerRequest::FileChangeRequestApproval { request_id, params } => {
                 self.approve_file_change_request(request_id, params)?;
             }
+            ServerRequest::ToolRequestUserInput { request_id, params } => {
+                let response = request_user_input::prompt_for_answers(&params)?;
+                self.send_server_request_response(request_id, &response)?;
+            }
             other => {
                 bail!("received unsupported server request: {other:?}");
             }
@@ -1910,14 +2169,15 @@ impl CodexClient {
             thread_id,
             turn_id,
             item_id,
+            started_at_ms: _,
             approval_id,
+            environment_id,
             reason,
             network_approval_context,
             command,
             cwd,
             command_actions,
             additional_permissions,
-            skill_metadata,
             proposed_execpolicy_amendment,
             proposed_network_policy_amendments,
             available_decisions,
@@ -1929,6 +2189,9 @@ impl CodexClient {
         );
         self.command_approval_count += 1;
         self.command_approval_item_ids.push(item_id.clone());
+        if let Some(environment_id) = environment_id.as_deref() {
+            println!("< environment: {environment_id}");
+        }
         if let Some(reason) = reason.as_deref() {
             println!("< reason: {reason}");
         }
@@ -1942,7 +2205,7 @@ impl CodexClient {
             println!("< command: {command}");
         }
         if let Some(cwd) = cwd.as_ref() {
-            println!("< cwd: {}", cwd.display());
+            println!("< cwd: {cwd}");
         }
         if let Some(command_actions) = command_actions.as_ref()
             && !command_actions.is_empty()
@@ -1951,9 +2214,6 @@ impl CodexClient {
         }
         if let Some(additional_permissions) = additional_permissions.as_ref() {
             println!("< additional permissions: {additional_permissions:?}");
-        }
-        if let Some(skill_metadata) = skill_metadata.as_ref() {
-            println!("< skill metadata: {skill_metadata:?}");
         }
         if let Some(execpolicy_amendment) = proposed_execpolicy_amendment.as_ref() {
             println!("< proposed execpolicy amendment: {execpolicy_amendment:?}");
@@ -1989,6 +2249,7 @@ impl CodexClient {
             thread_id,
             turn_id,
             item_id,
+            started_at_ms: _,
             reason,
             grant_root,
         } = params;

@@ -1,12 +1,15 @@
 use codex_core::config::Config;
-use codex_core::default_client::create_client;
-
-use crate::chatgpt_token::get_chatgpt_token_data;
-use crate::chatgpt_token::init_chatgpt_token_from_auth;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
+use codex_login::default_client::create_client;
 
 use anyhow::Context;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
+
+const OAI_PRODUCT_SKU_HEADER: &str = "OAI-Product-Sku";
+const CODEX_PRODUCT_SKU: &str = "codex";
 
 /// Make a GET request to the ChatGPT backend API.
 pub(crate) async fn chatgpt_get_request<T: DeserializeOwned>(
@@ -22,24 +25,33 @@ pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
     timeout: Option<Duration>,
 ) -> anyhow::Result<T> {
     let chatgpt_base_url = &config.chatgpt_base_url;
-    init_chatgpt_token_from_auth(&config.codex_home, config.cli_auth_credentials_store_mode)
-        .await?;
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let auth = auth_manager
+        .auth()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("ChatGPT auth not available"))?;
+    anyhow::ensure!(
+        auth.uses_codex_backend(),
+        "ChatGPT backend requests require Codex backend auth"
+    );
+    anyhow::ensure!(
+        auth.get_account_id().is_some(),
+        "ChatGPT account ID not available, please re-run `codex login`"
+    );
 
     // Make direct HTTP request to ChatGPT backend API with the token
     let client = create_client();
-    let url = format!("{chatgpt_base_url}{path}");
-
-    let token =
-        get_chatgpt_token_data().ok_or_else(|| anyhow::anyhow!("ChatGPT token not available"))?;
-
-    let account_id = token.account_id.ok_or_else(|| {
-        anyhow::anyhow!("ChatGPT account ID not available, please re-run `codex login`")
-    });
+    let url = format!(
+        "{}/{}",
+        chatgpt_base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
 
     let mut request = client
         .get(&url)
-        .bearer_auth(&token.access_token)
-        .header("chatgpt-account-id", account_id?)
+        .headers(codex_model_provider::auth_provider_from_auth(&auth).to_auth_headers())
+        .header(OAI_PRODUCT_SKU_HEADER, CODEX_PRODUCT_SKU)
         .header("Content-Type", "application/json");
 
     if let Some(timeout) = timeout {
@@ -54,6 +66,58 @@ pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
             .await
             .context("Failed to parse JSON response")?;
         Ok(result)
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Request failed with status {status}: {body}")
+    }
+}
+
+/// Make a POST request to the ChatGPT backend API with an already-captured auth identity.
+///
+/// Callers that bind other state to the auth snapshot should pass that same snapshot here rather
+/// than reacquiring auth while the request is in flight.
+pub(crate) async fn chatgpt_post_request_with_timeout<
+    TResponse: DeserializeOwned,
+    TRequest: Serialize + ?Sized,
+>(
+    config: &Config,
+    auth: &CodexAuth,
+    path: String,
+    body: &TRequest,
+    timeout: Duration,
+    product_sku: &str,
+) -> anyhow::Result<TResponse> {
+    anyhow::ensure!(
+        auth.uses_codex_backend(),
+        "ChatGPT backend requests require Codex backend auth"
+    );
+    anyhow::ensure!(
+        auth.get_account_id().is_some(),
+        "ChatGPT account ID not available, please re-run codex login"
+    );
+
+    let url = format!(
+        "{}/{}",
+        config.chatgpt_base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let response = create_client()
+        .post(&url)
+        .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers())
+        .header(OAI_PRODUCT_SKU_HEADER, product_sku)
+        .header("Content-Type", "application/json")
+        .timeout(timeout)
+        .json(body)
+        .send()
+        .await
+        .context("Failed to send request")?;
+
+    if response.status().is_success() {
+        response
+            .json()
+            .await
+            .context("Failed to parse JSON response")
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();

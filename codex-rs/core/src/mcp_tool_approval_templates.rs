@@ -170,7 +170,7 @@ fn render_tool_params(
         .iter()
         .filter(|(name, _)| !handled_names.contains(name.as_str()))
         .collect::<Vec<_>>();
-    remaining_params.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+    remaining_params.sort_by_key(|(name, _)| *name);
 
     for (name, value) in remaining_params {
         if handled_names.contains(name.as_str()) {
@@ -330,7 +330,7 @@ mod tests {
             &templates,
             "codex_apps",
             Some("github"),
-            None,
+            /*connector_name*/ None,
             Some("add_comment"),
             Some(&json!({})),
         );
@@ -361,7 +361,7 @@ mod tests {
                 &templates,
                 "codex_apps",
                 Some("calendar"),
-                None,
+                /*connector_name*/ None,
                 Some("create_event"),
                 Some(&json!({})),
             ),

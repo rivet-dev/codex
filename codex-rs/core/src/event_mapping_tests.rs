@@ -1,16 +1,74 @@
+use super::has_non_contextual_dev_message_content;
+use super::is_contextual_dev_message_content;
 use super::parse_turn_item;
+use crate::context::ContextualUserFragment;
+use crate::context::InternalContextSource;
+use crate::context::InternalModelContextFragment;
+use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::WebSearchItem;
 use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
+use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
+use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
+use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn recognizes_skills_instructions_as_contextual_developer_content() {
+    assert!(is_contextual_dev_message_content(&[
+        ContentItem::InputText {
+            text: format!("{SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills"),
+        },
+    ]));
+}
+
+#[test]
+fn recognizes_legacy_token_budget_as_contextual_developer_content() {
+    let content = vec![ContentItem::InputText {
+        text: "<token_budget>\nYou have 710 tokens left in this context window.\n</token_budget>"
+            .to_string(),
+    }];
+
+    assert!(is_contextual_dev_message_content(&content));
+    assert!(!has_non_contextual_dev_message_content(&content));
+}
+
+#[test]
+fn recognizes_context_window_as_contextual_developer_content() {
+    let content = vec![ContentItem::InputText {
+        text: format!(
+            r#"{CONTEXT_WINDOW_OPEN_TAG}
+Thread id: 00000000-0000-0000-0000-000000000000
+{CONTEXT_WINDOW_CLOSE_TAG}"#
+        ),
+    }];
+
+    assert!(is_contextual_dev_message_content(&content));
+    assert!(!has_non_contextual_dev_message_content(&content));
+}
+
+#[test]
+fn recognizes_context_window_guidance_as_contextual_developer_content() {
+    let content = vec![ContentItem::InputText {
+        text: format!(
+            "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\nPreserve important state.\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+        ),
+    }];
+
+    assert!(is_contextual_dev_message_content(&content));
+    assert!(!has_non_contextual_dev_message_content(&content));
+}
 
 #[test]
 fn parses_user_message_with_text_and_two_images() {
@@ -26,13 +84,15 @@ fn parses_user_message_with_text_and_two_images() {
             },
             ContentItem::InputImage {
                 image_url: img1.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputImage {
                 image_url: img2.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -44,8 +104,14 @@ fn parses_user_message_with_text_and_two_images() {
                     text: "Hello world".to_string(),
                     text_elements: Vec::new(),
                 },
-                UserInput::Image { image_url: img1 },
-                UserInput::Image { image_url: img2 },
+                UserInput::Image {
+                    image_url: img1,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+                UserInput::Image {
+                    image_url: img2,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
             ];
             assert_eq!(user.content, expected_content);
         }
@@ -56,7 +122,7 @@ fn parses_user_message_with_text_and_two_images() {
 #[test]
 fn skips_local_image_label_text() {
     let image_url = "data:image/png;base64,abc".to_string();
-    let label = codex_protocol::models::local_image_open_tag_text(1);
+    let label = r#"<image name=[Image #1] path="/tmp/local.png">"#.to_string();
     let user_text = "Please review this image.".to_string();
 
     let item = ResponseItem::Message {
@@ -66,6 +132,7 @@ fn skips_local_image_label_text() {
             ContentItem::InputText { text: label },
             ContentItem::InputImage {
                 image_url: image_url.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
                 text: "</image>".to_string(),
@@ -74,8 +141,8 @@ fn skips_local_image_label_text() {
                 text: user_text.clone(),
             },
         ],
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -83,7 +150,10 @@ fn skips_local_image_label_text() {
     match turn_item {
         TurnItem::UserMessage(user) => {
             let expected_content = vec![
-                UserInput::Image { image_url },
+                UserInput::Image {
+                    image_url,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
                 UserInput::Text {
                     text: user_text,
                     text_elements: Vec::new(),
@@ -92,6 +162,87 @@ fn skips_local_image_label_text() {
             assert_eq!(user.content, expected_content);
         }
         other => panic!("expected TurnItem::UserMessage, got {other:?}"),
+    }
+}
+
+#[test]
+fn skips_local_audio_label_text() {
+    let audio_url = "data:audio/wav;base64,abc".to_string();
+    let label = r#"<audio name=[Audio #1] path="/tmp/local.wav">"#.to_string();
+    let user_text = "Please transcribe this audio.".to_string();
+
+    let item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText { text: label },
+            ContentItem::InputAudio {
+                audio_url: audio_url.clone(),
+            },
+            ContentItem::InputText {
+                text: "</audio>".to_string(),
+            },
+            ContentItem::InputText {
+                text: user_text.clone(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let turn_item = parse_turn_item(&item).expect("expected user message turn item");
+
+    match turn_item {
+        TurnItem::UserMessage(user) => {
+            assert_eq!(
+                user.content,
+                vec![
+                    UserInput::Audio { audio_url },
+                    UserInput::Text {
+                        text: user_text,
+                        text_elements: Vec::new(),
+                    },
+                ]
+            );
+        }
+        other => panic!("expected TurnItem::UserMessage, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_assistant_message_input_text_for_backward_compatibility() {
+    let item = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue"
+                .to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let turn_item = parse_turn_item(&item).expect("expected assistant message turn item");
+
+    match turn_item {
+        TurnItem::AgentMessage(message) => {
+            let rendered = message
+                .content
+                .into_iter()
+                .map(|content| {
+                    let AgentMessageContent::Text { text } = content;
+                    text
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rendered,
+                vec![
+                    "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue"
+                        .to_string()
+                ]
+            );
+        }
+        other => panic!("expected TurnItem::AgentMessage, got {other:?}"),
     }
 }
 
@@ -108,6 +259,7 @@ fn skips_unnamed_image_label_text() {
             ContentItem::InputText { text: label },
             ContentItem::InputImage {
                 image_url: image_url.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
                 text: codex_protocol::models::image_close_tag_text(),
@@ -116,8 +268,8 @@ fn skips_unnamed_image_label_text() {
                 text: user_text.clone(),
             },
         ],
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected user message turn item");
@@ -125,7 +277,10 @@ fn skips_unnamed_image_label_text() {
     match turn_item {
         TurnItem::UserMessage(user) => {
             let expected_content = vec![
-                UserInput::Image { image_url },
+                UserInput::Image {
+                    image_url,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
                 UserInput::Text {
                     text: user_text,
                     text_elements: Vec::new(),
@@ -146,27 +301,24 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
-                end_turn: None,
             phase: None,
-            },
+                internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "<environment_context>test_text</environment_context>".to_string(),
                 }],
-                end_turn: None,
             phase: None,
-            },
+                internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
-                end_turn: None,
             phase: None,
-            },
+                internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
@@ -174,18 +326,16 @@ fn skips_user_instructions_and_env() {
                     text: "<skill>\n<name>demo</name>\n<path>skills/demo/SKILL.md</path>\nbody\n</skill>"
                         .to_string(),
                 }],
-                end_turn: None,
             phase: None,
-            },
+                internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "<user_shell_command>echo 42</user_shell_command>".to_string(),
                 }],
-                end_turn: None,
             phase: None,
-            },
+                internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
@@ -199,9 +349,8 @@ fn skips_user_instructions_and_env() {
                                 .to_string(),
                     },
                 ],
-                end_turn: None,
                 phase: None,
-            },
+                internal_chat_message_metadata_passthrough: None,},
         ];
 
     for item in items {
@@ -238,7 +387,7 @@ fn parses_hook_prompt_message_as_distinct_turn_item() {
 #[test]
 fn parses_hook_prompt_and_hides_other_contextual_fragments() {
     let item = ResponseItem::Message {
-        id: Some("msg-1".to_string()),
+        id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "user".to_string(),
         content: vec![
             ContentItem::InputText {
@@ -250,15 +399,14 @@ fn parses_hook_prompt_and_hides_other_contextual_fragments() {
                         .to_string(),
             },
         ],
-        end_turn: None,
         phase: None,
-    };
+        internal_chat_message_metadata_passthrough: None,};
 
     let turn_item = parse_turn_item(&item).expect("expected hook prompt turn item");
 
     match turn_item {
         TurnItem::HookPrompt(hook_prompt) => {
-            assert_eq!(hook_prompt.id, "msg-1");
+            assert_eq!(hook_prompt.id, "msg_1");
             assert_eq!(
                 hook_prompt.fragments,
                 vec![HookPromptFragment {
@@ -272,15 +420,34 @@ fn parses_hook_prompt_and_hides_other_contextual_fragments() {
 }
 
 #[test]
+fn internal_model_context_does_not_parse_as_visible_turn_item() {
+    let item = ResponseItem::Message {
+        id: Some(ResponseItemId::with_suffix("msg", "1")),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: InternalModelContextFragment::new(
+                InternalContextSource::from_static("extension"),
+                "Internal steering.",
+            )
+            .render(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    assert!(parse_turn_item(&item).is_none());
+}
+
+#[test]
 fn parses_agent_message() {
     let item = ResponseItem::Message {
-        id: Some("msg-1".to_string()),
+        id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: "Hello from Codex".to_string(),
         }],
-        end_turn: None,
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected agent message turn item");
@@ -299,7 +466,7 @@ fn parses_agent_message() {
 #[test]
 fn parses_reasoning_summary_and_raw_content() {
     let item = ResponseItem::Reasoning {
-        id: "reasoning_1".to_string(),
+        id: Some(ResponseItemId::with_suffix("rs", "1")),
         summary: vec![
             ReasoningItemReasoningSummary::SummaryText {
                 text: "Step 1".to_string(),
@@ -312,6 +479,7 @@ fn parses_reasoning_summary_and_raw_content() {
             text: "raw details".to_string(),
         }]),
         encrypted_content: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected reasoning turn item");
@@ -331,7 +499,7 @@ fn parses_reasoning_summary_and_raw_content() {
 #[test]
 fn parses_reasoning_including_raw_content() {
     let item = ResponseItem::Reasoning {
-        id: "reasoning_2".to_string(),
+        id: Some(ResponseItemId::with_suffix("rs", "2")),
         summary: vec![ReasoningItemReasoningSummary::SummaryText {
             text: "Summarized step".to_string(),
         }],
@@ -344,6 +512,7 @@ fn parses_reasoning_including_raw_content() {
             },
         ]),
         encrypted_content: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected reasoning turn item");
@@ -363,12 +532,13 @@ fn parses_reasoning_including_raw_content() {
 #[test]
 fn parses_web_search_call() {
     let item = ResponseItem::WebSearchCall {
-        id: Some("ws_1".to_string()),
+        id: Some(ResponseItemId::with_suffix("ws", "1")),
         status: Some("completed".to_string()),
         action: Some(WebSearchAction::Search {
             query: Some("weather".to_string()),
             queries: None,
         }),
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected web search turn item");
@@ -383,6 +553,7 @@ fn parses_web_search_call() {
                     query: Some("weather".to_string()),
                     queries: None,
                 },
+                results: None,
             }
         ),
         other => panic!("expected TurnItem::WebSearch, got {other:?}"),
@@ -392,11 +563,12 @@ fn parses_web_search_call() {
 #[test]
 fn parses_web_search_open_page_call() {
     let item = ResponseItem::WebSearchCall {
-        id: Some("ws_open".to_string()),
+        id: Some(ResponseItemId::with_suffix("ws", "open")),
         status: Some("completed".to_string()),
         action: Some(WebSearchAction::OpenPage {
             url: Some("https://example.com".to_string()),
         }),
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected web search turn item");
@@ -410,6 +582,7 @@ fn parses_web_search_open_page_call() {
                 action: WebSearchAction::OpenPage {
                     url: Some("https://example.com".to_string()),
                 },
+                results: None,
             }
         ),
         other => panic!("expected TurnItem::WebSearch, got {other:?}"),
@@ -419,12 +592,13 @@ fn parses_web_search_open_page_call() {
 #[test]
 fn parses_web_search_find_in_page_call() {
     let item = ResponseItem::WebSearchCall {
-        id: Some("ws_find".to_string()),
+        id: Some(ResponseItemId::with_suffix("ws", "find")),
         status: Some("completed".to_string()),
         action: Some(WebSearchAction::FindInPage {
             url: Some("https://example.com".to_string()),
             pattern: Some("needle".to_string()),
         }),
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected web search turn item");
@@ -439,6 +613,7 @@ fn parses_web_search_find_in_page_call() {
                     url: Some("https://example.com".to_string()),
                     pattern: Some("needle".to_string()),
                 },
+                results: None,
             }
         ),
         other => panic!("expected TurnItem::WebSearch, got {other:?}"),
@@ -448,9 +623,10 @@ fn parses_web_search_find_in_page_call() {
 #[test]
 fn parses_partial_web_search_call_without_action_as_other() {
     let item = ResponseItem::WebSearchCall {
-        id: Some("ws_partial".to_string()),
+        id: Some(ResponseItemId::with_suffix("ws", "partial")),
         status: Some("in_progress".to_string()),
         action: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let turn_item = parse_turn_item(&item).expect("expected web search turn item");
@@ -461,6 +637,7 @@ fn parses_partial_web_search_call_without_action_as_other() {
                 id: "ws_partial".to_string(),
                 query: String::new(),
                 action: WebSearchAction::Other,
+                results: None,
             }
         ),
         other => panic!("expected TurnItem::WebSearch, got {other:?}"),

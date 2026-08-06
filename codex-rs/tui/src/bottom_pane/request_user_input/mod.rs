@@ -4,12 +4,15 @@
 //! - Each question can be answered by selecting one option and/or providing notes.
 //! - Notes are stored per question and appended as extra answers.
 //! - Typing while focused on options jumps into notes to keep freeform input fast.
-//! - Enter advances to the next question; the last question submits all answers.
+//! - The composer submit binding advances to the next question; the last question submits all answers.
 //! - Freeform-only questions submit an empty answer list when empty.
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
+use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -28,12 +31,23 @@ use crate::bottom_pane::scroll_state::ScrollState;
 use crate::bottom_pane::selection_popup_common::GenericDisplayRow;
 use crate::bottom_pane::selection_popup_common::measure_rows_height;
 use crate::history_cell;
+use crate::key_hint::KeyBinding;
+use crate::key_hint::KeyBindingListExt;
+use crate::key_hint::ShortcutHint;
+use crate::keymap::KeymapContext;
+use crate::keymap::ListAction;
+use crate::keymap::ListKeymap;
+use crate::keymap::RuntimeKeymap;
 use crate::render::renderable::Renderable;
 
-use codex_protocol::protocol::Op;
-use codex_protocol::request_user_input::RequestUserInputAnswer;
-use codex_protocol::request_user_input::RequestUserInputEvent;
-use codex_protocol::request_user_input::RequestUserInputResponse;
+#[cfg(test)]
+use crate::app_command::AppCommand as Op;
+use codex_app_server_protocol::ToolRequestUserInputAnswer;
+#[cfg(test)]
+use codex_app_server_protocol::ToolRequestUserInputOption;
+use codex_app_server_protocol::ToolRequestUserInputParams;
+use codex_app_server_protocol::ToolRequestUserInputQuestion;
+use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_protocol::user_input::TextElement;
 use unicode_width::UnicodeWidthStr;
 
@@ -52,11 +66,34 @@ const UNANSWERED_CONFIRM_GO_BACK_DESC: &str = "Return to the first unanswered qu
 const UNANSWERED_CONFIRM_SUBMIT: &str = "Proceed";
 const UNANSWERED_CONFIRM_SUBMIT_DESC_SINGULAR: &str = "question";
 const UNANSWERED_CONFIRM_SUBMIT_DESC_PLURAL: &str = "questions";
+const AUTO_RESOLUTION_HIDDEN_GRACE: Duration = Duration::from_secs(/*secs*/ 60);
+const AUTO_RESOLUTION_VISIBLE_COUNTDOWN: Duration = Duration::from_secs(/*secs*/ 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Options,
     Notes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoResolutionTiming {
+    Disabled,
+    HiddenGrace { remaining: Duration },
+    VisibleCountdown { remaining: Duration },
+    Due,
+}
+
+fn format_auto_resolution_remaining(remaining: Duration) -> String {
+    let mut seconds = remaining.as_secs();
+    if remaining.subsec_nanos() > 0 {
+        seconds = seconds.saturating_add(1);
+    }
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    format!("{minutes}m {seconds:02}s")
 }
 
 #[derive(Default, Clone, PartialEq)]
@@ -120,9 +157,9 @@ impl FooterTip {
 
 pub(crate) struct RequestUserInputOverlay {
     app_event_tx: AppEventSender,
-    request: RequestUserInputEvent,
+    request: ToolRequestUserInputParams,
     // Queue of incoming requests to process after the current one.
-    queue: VecDeque<RequestUserInputEvent>,
+    queue: VecDeque<ToolRequestUserInputParams>,
     // Reuse the shared chat composer so notes/freeform answers match the
     // primary input styling and behavior.
     composer: ChatComposer,
@@ -133,15 +170,41 @@ pub(crate) struct RequestUserInputOverlay {
     done: bool,
     pending_submission_draft: Option<ComposerDraft>,
     confirm_unanswered: Option<ScrollState>,
+    request_started_at: Instant,
+    auto_resolution_snoozed: bool,
+    composer_submit_keys: Vec<KeyBinding>,
+    composer_submit_hint: Option<ShortcutHint>,
+    interrupt_turn_keys: Vec<KeyBinding>,
+    interrupt_turn_hint: Option<ShortcutHint>,
+    list_keymap: ListKeymap,
 }
 
 impl RequestUserInputOverlay {
+    #[cfg(test)]
     pub(crate) fn new(
-        request: RequestUserInputEvent,
+        request: ToolRequestUserInputParams,
         app_event_tx: AppEventSender,
         has_input_focus: bool,
         enhanced_keys_supported: bool,
         disable_paste_burst: bool,
+    ) -> Self {
+        Self::new_with_keymap(
+            request,
+            app_event_tx,
+            has_input_focus,
+            enhanced_keys_supported,
+            disable_paste_burst,
+            RuntimeKeymap::defaults(),
+        )
+    }
+
+    pub(crate) fn new_with_keymap(
+        request: ToolRequestUserInputParams,
+        app_event_tx: AppEventSender,
+        has_input_focus: bool,
+        enhanced_keys_supported: bool,
+        disable_paste_burst: bool,
+        keymap: RuntimeKeymap,
     ) -> Self {
         // Use the same composer widget, but disable popups/slash-commands and
         // image-path attachment so it behaves like a focused notes field.
@@ -153,6 +216,7 @@ impl RequestUserInputOverlay {
             disable_paste_burst,
             ChatComposerConfig::plain_text(),
         );
+        composer.set_keymap_bindings(&keymap);
         // The overlay renders its own footer hints, so keep the composer footer empty.
         composer.set_footer_hint_override(Some(Vec::new()));
         let mut overlay = Self {
@@ -166,6 +230,13 @@ impl RequestUserInputOverlay {
             done: false,
             pending_submission_draft: None,
             confirm_unanswered: None,
+            request_started_at: Instant::now(),
+            auto_resolution_snoozed: false,
+            composer_submit_keys: keymap.composer.submit.clone(),
+            composer_submit_hint: keymap.primary_hint(KeymapContext::Composer, "submit"),
+            interrupt_turn_keys: keymap.chat.interrupt_turn.clone(),
+            interrupt_turn_hint: keymap.primary_hint(KeymapContext::Chat, "interrupt_turn"),
+            list_keymap: keymap.list,
         };
         overlay.reset_for_request();
         overlay.ensure_focus_available();
@@ -177,9 +248,7 @@ impl RequestUserInputOverlay {
         self.current_idx
     }
 
-    fn current_question(
-        &self,
-    ) -> Option<&codex_protocol::request_user_input::RequestUserInputQuestion> {
+    fn current_question(&self) -> Option<&ToolRequestUserInputQuestion> {
         self.request.questions.get(self.current_index())
     }
 
@@ -195,6 +264,97 @@ impl RequestUserInputOverlay {
 
     fn question_count(&self) -> usize {
         self.request.questions.len()
+    }
+
+    fn advance_queue_or_complete_at(&mut self, now: Instant) {
+        if let Some(next) = self.queue.pop_front() {
+            self.request = next;
+            self.request_started_at = now;
+            self.auto_resolution_snoozed = false;
+            self.reset_for_request();
+            self.ensure_focus_available();
+            self.restore_current_draft();
+        } else {
+            self.done = true;
+        }
+    }
+
+    fn snooze_auto_resolution(&mut self) {
+        if !self.request.is_blocking {
+            self.auto_resolution_snoozed = true;
+        }
+    }
+
+    fn auto_resolution_timing_at(&self, now: Instant) -> AutoResolutionTiming {
+        // autoResolutionMs is deprecated; isBlocking now controls whether the
+        // request can auto-resolve using the TUI's fixed grace/countdown policy.
+        if self.request.is_blocking || self.auto_resolution_snoozed {
+            return AutoResolutionTiming::Disabled;
+        }
+
+        let elapsed = now.saturating_duration_since(self.request_started_at);
+        if elapsed < AUTO_RESOLUTION_HIDDEN_GRACE {
+            return AutoResolutionTiming::HiddenGrace {
+                remaining: AUTO_RESOLUTION_HIDDEN_GRACE.saturating_sub(elapsed),
+            };
+        }
+        let visible_elapsed = elapsed.saturating_sub(AUTO_RESOLUTION_HIDDEN_GRACE);
+        if visible_elapsed < AUTO_RESOLUTION_VISIBLE_COUNTDOWN {
+            return AutoResolutionTiming::VisibleCountdown {
+                remaining: AUTO_RESOLUTION_VISIBLE_COUNTDOWN.saturating_sub(visible_elapsed),
+            };
+        }
+        AutoResolutionTiming::Due
+    }
+
+    fn auto_resolution_next_frame_delay_at(&self, now: Instant) -> Option<Duration> {
+        match self.auto_resolution_timing_at(now) {
+            AutoResolutionTiming::Disabled => None,
+            AutoResolutionTiming::HiddenGrace { remaining } => Some(remaining),
+            AutoResolutionTiming::VisibleCountdown { remaining } => {
+                Some(remaining.min(Duration::from_secs(/*secs*/ 1)))
+            }
+            AutoResolutionTiming::Due => Some(Duration::ZERO),
+        }
+    }
+
+    fn maybe_auto_resolve_at(&mut self, now: Instant) -> bool {
+        if !matches!(
+            self.auto_resolution_timing_at(now),
+            AutoResolutionTiming::Due
+        ) {
+            return false;
+        }
+        self.submit_empty_auto_resolution(now);
+        true
+    }
+
+    fn auto_resolution_countdown_text_at(&self, now: Instant) -> Option<String> {
+        match self.auto_resolution_timing_at(now) {
+            AutoResolutionTiming::VisibleCountdown { remaining } => Some(format!(
+                "auto-resolves in {}",
+                format_auto_resolution_remaining(remaining)
+            )),
+            AutoResolutionTiming::Disabled
+            | AutoResolutionTiming::HiddenGrace { .. }
+            | AutoResolutionTiming::Due => None,
+        }
+    }
+
+    pub(super) fn progress_prefix_text(&self) -> String {
+        if self.question_count() > 0 {
+            let idx = self.current_index() + 1;
+            let total = self.question_count();
+            let base = format!("Question {idx}/{total}");
+            let unanswered = self.unanswered_count();
+            if unanswered > 0 {
+                format!("{base} ({unanswered} unanswered)")
+            } else {
+                base
+            }
+        } else {
+            "No questions".to_string()
+        }
     }
 
     fn has_options(&self) -> bool {
@@ -440,14 +600,23 @@ impl RequestUserInputOverlay {
 
         let question_count = self.question_count();
         let is_last_question = self.current_index().saturating_add(1) >= question_count;
-        let enter_tip = if question_count == 1 {
-            FooterTip::highlighted("enter to submit answer")
-        } else if is_last_question {
-            FooterTip::highlighted("enter to submit all")
+        let submit_key = if self.focus_is_notes() || !self.has_options() {
+            self.composer_submit_hint.map(ShortcutHint::display_label)
         } else {
-            FooterTip::new("enter to submit answer")
+            self.list_keymap
+                .primary_hint(ListAction::Accept)
+                .map(ShortcutHint::display_label)
         };
-        tips.push(enter_tip);
+        if let Some(submit_key) = submit_key {
+            let submit_tip = if question_count == 1 {
+                FooterTip::highlighted(format!("{submit_key} to submit answer"))
+            } else if is_last_question {
+                FooterTip::highlighted(format!("{submit_key} to submit all"))
+            } else {
+                FooterTip::new(format!("{submit_key} to submit answer"))
+            };
+            tips.push(submit_tip);
+        }
         if question_count > 1 {
             if self.has_options() && !self.focus_is_notes() {
                 tips.push(FooterTip::new("←/→ to navigate questions"));
@@ -455,8 +624,15 @@ impl RequestUserInputOverlay {
                 tips.push(FooterTip::new("ctrl + p / ctrl + n change question"));
             }
         }
-        if !(self.has_options() && notes_visible) {
-            tips.push(FooterTip::new("esc to interrupt"));
+        if let Some(interrupt_key) = self.interrupt_turn_hint
+            && !(self.has_options()
+                && notes_visible
+                && interrupt_key == ShortcutHint::Single(crate::key_hint::plain(KeyCode::Esc)))
+        {
+            tips.push(FooterTip::new(format!(
+                "{} to interrupt",
+                interrupt_key.display_label()
+            )));
         }
         tips
     }
@@ -573,9 +749,7 @@ impl RequestUserInputOverlay {
         self.pending_submission_draft = None;
     }
 
-    fn options_len_for_question(
-        question: &codex_protocol::request_user_input::RequestUserInputQuestion,
-    ) -> usize {
+    fn options_len_for_question(question: &ToolRequestUserInputQuestion) -> usize {
         let options_len = question
             .options
             .as_ref()
@@ -588,9 +762,7 @@ impl RequestUserInputOverlay {
         }
     }
 
-    fn other_option_enabled_for_question(
-        question: &codex_protocol::request_user_input::RequestUserInputQuestion,
-    ) -> bool {
+    fn other_option_enabled_for_question(question: &ToolRequestUserInputQuestion) -> bool {
         question.is_other
             && question
                 .options
@@ -599,7 +771,7 @@ impl RequestUserInputOverlay {
     }
 
     fn option_label_for_index(
-        question: &codex_protocol::request_user_input::RequestUserInputQuestion,
+        question: &ToolRequestUserInputQuestion,
         idx: usize,
     ) -> Option<String> {
         let options = question.options.as_ref()?;
@@ -740,18 +912,17 @@ impl RequestUserInputOverlay {
             }
             answers.insert(
                 question.id.clone(),
-                RequestUserInputAnswer {
+                ToolRequestUserInputAnswer {
                     answers: answer_list,
                 },
             );
         }
-        self.app_event_tx
-            .send(AppEvent::CodexOp(Op::UserInputAnswer {
-                id: self.request.turn_id.clone(),
-                response: RequestUserInputResponse {
-                    answers: answers.clone(),
-                },
-            }));
+        self.app_event_tx.user_input_answer(
+            self.request.turn_id.clone(),
+            ToolRequestUserInputResponse {
+                answers: answers.clone(),
+            },
+        );
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
             history_cell::RequestUserInputResultCell {
                 questions: self.request.questions.clone(),
@@ -759,14 +930,42 @@ impl RequestUserInputOverlay {
                 interrupted: false,
             },
         )));
-        if let Some(next) = self.queue.pop_front() {
-            self.request = next;
-            self.reset_for_request();
-            self.ensure_focus_available();
-            self.restore_current_draft();
-        } else {
-            self.done = true;
+        self.advance_queue_or_complete_at(Instant::now());
+    }
+
+    fn submit_empty_auto_resolution(&mut self, now: Instant) {
+        self.confirm_unanswered = None;
+        let answers: HashMap<String, ToolRequestUserInputAnswer> = HashMap::new();
+        self.app_event_tx.user_input_answer(
+            self.request.turn_id.clone(),
+            ToolRequestUserInputResponse {
+                answers: answers.clone(),
+            },
+        );
+        self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+            history_cell::RequestUserInputResultCell {
+                questions: self.request.questions.clone(),
+                answers,
+                interrupted: false,
+            },
+        )));
+        self.advance_queue_or_complete_at(now);
+    }
+
+    fn dismiss_resolved_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
+        let ResolvedAppServerRequest::UserInput { call_id } = request else {
+            return false;
+        };
+
+        let queue_len = self.queue.len();
+        self.queue
+            .retain(|queued_request| queued_request.item_id != *call_id);
+        if self.request.item_id == *call_id {
+            self.advance_queue_or_complete_at(Instant::now());
+            return true;
         }
+
+        self.queue.len() != queue_len
     }
 
     fn open_unanswered_confirmation(&mut self) {
@@ -912,6 +1111,7 @@ impl RequestUserInputOverlay {
             | InputResult::Queued {
                 text,
                 text_elements,
+                ..
             } => {
                 if self.has_options()
                     && matches!(self.focus, Focus::Notes)
@@ -986,8 +1186,36 @@ impl RequestUserInputOverlay {
 }
 
 impl BottomPaneView for RequestUserInputOverlay {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        if self.confirm_unanswered_active() {
+            return crate::keymap::KeymapContextSet::default();
+        }
+        if matches!(self.focus, Focus::Options) {
+            return crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+                .with(crate::keymap::KeymapContext::Chat);
+        }
+        self.composer
+            .keymap_contexts()
+            .with(crate::keymap::KeymapContext::Chat)
+    }
+
     fn prefer_esc_to_handle_key_event(&self) -> bool {
         true
+    }
+
+    fn will_interrupt_turn_on_key_event(&self, key_event: KeyEvent) -> bool {
+        if KeyBinding::new(KeyCode::Char('c'), KeyModifiers::CONTROL).is_press(key_event) {
+            return self.confirm_unanswered_active()
+                || !self.focus_is_notes()
+                || self.composer.current_text_with_pending().is_empty();
+        }
+
+        key_event.kind != KeyEventKind::Release
+            && !self.confirm_unanswered_active()
+            && !(matches!(key_event.code, KeyCode::Esc)
+                && self.has_options()
+                && self.notes_ui_visible())
+            && self.interrupt_turn_keys.is_pressed(key_event)
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
@@ -995,20 +1223,37 @@ impl BottomPaneView for RequestUserInputOverlay {
             return;
         }
 
+        self.snooze_auto_resolution();
+
         if self.confirm_unanswered_active() {
             self.handle_confirm_unanswered_key_event(key_event);
             return;
         }
 
-        if matches!(key_event.code, KeyCode::Esc) {
-            if self.has_options() && self.notes_ui_visible() {
-                self.clear_notes_and_focus_options();
-                return;
-            }
+        if matches!(key_event.code, KeyCode::Esc) && self.has_options() && self.notes_ui_visible() {
+            self.clear_notes_and_focus_options();
+            return;
+        }
+
+        if self.interrupt_turn_keys.is_pressed(key_event) {
             // TODO: Emit interrupted request_user_input results (including committed answers)
             // once core supports persisting them reliably without follow-up turn issues.
-            self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
+            self.app_event_tx.interrupt();
             self.done = true;
+            return;
+        }
+
+        if self.focus_is_notes() && self.composer_submit_keys.is_pressed(key_event) {
+            self.ensure_selected_for_notes();
+            self.pending_submission_draft = Some(self.capture_composer_draft());
+            let (result, _) = self.composer.handle_key_event(key_event);
+            if !self.handle_composer_input_result(result) {
+                self.pending_submission_draft = None;
+                if self.has_options() {
+                    self.select_current_option(/*committed*/ true);
+                }
+                self.go_next_or_submit();
+            }
             return;
         }
 
@@ -1044,11 +1289,8 @@ impl BottomPaneView for RequestUserInputOverlay {
                 code: KeyCode::Char('h'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } if self.has_options() && matches!(self.focus, Focus::Options) => {
-                self.move_question(/*next*/ false);
-                return;
             }
-            KeyEvent {
+            | KeyEvent {
                 code: KeyCode::Left,
                 modifiers: KeyModifiers::NONE,
                 ..
@@ -1056,19 +1298,30 @@ impl BottomPaneView for RequestUserInputOverlay {
                 self.move_question(/*next*/ false);
                 return;
             }
+            _ if self.has_options()
+                && matches!(self.focus, Focus::Options)
+                && self.list_keymap.action_for(key_event) == Some(ListAction::MoveLeft) =>
+            {
+                self.move_question(/*next*/ false);
+                return;
+            }
             KeyEvent {
                 code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Right,
                 modifiers: KeyModifiers::NONE,
                 ..
             } if self.has_options() && matches!(self.focus, Focus::Options) => {
                 self.move_question(/*next*/ true);
                 return;
             }
-            KeyEvent {
-                code: KeyCode::Right,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if self.has_options() && matches!(self.focus, Focus::Options) => {
+            _ if self.has_options()
+                && matches!(self.focus, Focus::Options)
+                && self.list_keymap.action_for(key_event) == Some(ListAction::MoveRight) =>
+            {
                 self.move_question(/*next*/ true);
                 return;
             }
@@ -1079,8 +1332,8 @@ impl BottomPaneView for RequestUserInputOverlay {
             Focus::Options => {
                 let options_len = self.options_len();
                 // Keep selection synchronized as the user moves.
-                match key_event.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
+                match (self.list_keymap.action_for(key_event), key_event.code) {
+                    (Some(ListAction::MoveUp), _) | (_, KeyCode::Up | KeyCode::Char('k')) => {
                         let moved = if let Some(answer) = self.current_answer_mut() {
                             answer.options_state.move_up_wrap(options_len);
                             answer.answer_committed = false;
@@ -1092,7 +1345,7 @@ impl BottomPaneView for RequestUserInputOverlay {
                             self.sync_composer_placeholder();
                         }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    (Some(ListAction::MoveDown), _) | (_, KeyCode::Down | KeyCode::Char('j')) => {
                         let moved = if let Some(answer) = self.current_answer_mut() {
                             answer.options_state.move_down_wrap(options_len);
                             answer.answer_committed = false;
@@ -1104,26 +1357,24 @@ impl BottomPaneView for RequestUserInputOverlay {
                             self.sync_composer_placeholder();
                         }
                     }
-                    KeyCode::Char(' ') => {
+                    (_, KeyCode::Char(' ')) => {
                         self.select_current_option(/*committed*/ true);
                     }
-                    KeyCode::Backspace | KeyCode::Delete => {
+                    (_, KeyCode::Backspace | KeyCode::Delete) => {
                         self.clear_selection();
                     }
-                    KeyCode::Tab => {
-                        if self.selected_option_index().is_some() {
-                            self.focus = Focus::Notes;
-                            self.ensure_selected_for_notes();
-                        }
+                    (_, KeyCode::Tab) if self.selected_option_index().is_some() => {
+                        self.focus = Focus::Notes;
+                        self.ensure_selected_for_notes();
                     }
-                    KeyCode::Enter => {
+                    (Some(ListAction::Accept), _) | (_, KeyCode::Enter) => {
                         let has_selection = self.selected_option_index().is_some();
                         if has_selection {
                             self.select_current_option(/*committed*/ true);
                         }
                         self.go_next_or_submit();
                     }
-                    KeyCode::Char(ch) => {
+                    (_, KeyCode::Char(ch)) => {
                         if let Some(option_idx) = self.option_index_for_digit(ch) {
                             if let Some(answer) = self.current_answer_mut() {
                                 answer.options_state.selected_idx = Some(option_idx);
@@ -1149,19 +1400,6 @@ impl BottomPaneView for RequestUserInputOverlay {
                     }
                     self.focus = Focus::Options;
                     self.sync_composer_placeholder();
-                    return;
-                }
-                if matches!(key_event.code, KeyCode::Enter) {
-                    self.ensure_selected_for_notes();
-                    self.pending_submission_draft = Some(self.capture_composer_draft());
-                    let (result, _) = self.composer.handle_key_event(key_event);
-                    if !self.handle_composer_input_result(result) {
-                        self.pending_submission_draft = None;
-                        if self.has_options() {
-                            self.select_current_option(/*committed*/ true);
-                        }
-                        self.go_next_or_submit();
-                    }
                     return;
                 }
                 if self.has_options() && matches!(key_event.code, KeyCode::Up | KeyCode::Down) {
@@ -1218,12 +1456,16 @@ impl BottomPaneView for RequestUserInputOverlay {
         }
     }
 
+    fn terminal_title_requires_action(&self) -> bool {
+        true
+    }
+
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         if self.confirm_unanswered_active() {
             self.close_unanswered_confirmation();
             // TODO: Emit interrupted request_user_input results (including committed answers)
             // once core supports persisting them reliably without follow-up turn issues.
-            self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
+            self.app_event_tx.interrupt();
             self.done = true;
             return CancellationEvent::Handled;
         }
@@ -1234,7 +1476,7 @@ impl BottomPaneView for RequestUserInputOverlay {
 
         // TODO: Emit interrupted request_user_input results (including committed answers)
         // once core supports persisting them reliably without follow-up turn issues.
-        self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
+        self.app_event_tx.interrupt();
         self.done = true;
         CancellationEvent::Handled
     }
@@ -1247,6 +1489,7 @@ impl BottomPaneView for RequestUserInputOverlay {
         if pasted.is_empty() {
             return false;
         }
+        self.snooze_auto_resolution();
         if matches!(self.focus, Focus::Options) {
             // Treat pastes the same as typing: switch into notes.
             self.focus = Focus::Notes;
@@ -1266,12 +1509,24 @@ impl BottomPaneView for RequestUserInputOverlay {
         self.composer.is_in_paste_burst()
     }
 
+    fn pre_draw_tick(&mut self, now: Instant) -> bool {
+        self.maybe_auto_resolve_at(now)
+    }
+
+    fn next_frame_delay(&self) -> Option<Duration> {
+        self.auto_resolution_next_frame_delay_at(Instant::now())
+    }
+
     fn try_consume_user_input_request(
         &mut self,
-        request: RequestUserInputEvent,
-    ) -> Option<RequestUserInputEvent> {
+        request: ToolRequestUserInputParams,
+    ) -> Option<ToolRequestUserInputParams> {
         self.queue.push_back(request);
         None
+    }
+
+    fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
+        self.dismiss_resolved_request(request)
     }
 }
 
@@ -1281,12 +1536,15 @@ mod tests {
     use crate::app_event::AppEvent;
     use crate::bottom_pane::selection_popup_common::menu_surface_inset;
     use crate::render::renderable::Renderable;
-    use codex_protocol::request_user_input::RequestUserInputQuestion;
-    use codex_protocol::request_user_input::RequestUserInputQuestionOption;
+    use codex_config::types::KeybindingSpec;
+    use codex_config::types::KeybindingsSpec;
+    use codex_config::types::TuiKeymap;
     use pretty_assertions::assert_eq;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+    use ratatui::style::Color;
     use std::collections::HashMap;
+    use std::time::Instant;
     use tokio::sync::mpsc::unbounded_channel;
     use unicode_width::UnicodeWidthStr;
 
@@ -1303,30 +1561,30 @@ mod tests {
         let AppEvent::CodexOp(op) = event else {
             panic!("expected CodexOp");
         };
-        assert_eq!(op, Op::Interrupt);
+        assert_eq!(op, Op::interrupt());
         assert!(
             rx.try_recv().is_err(),
             "unexpected AppEvents before interrupt completion"
         );
     }
 
-    fn question_with_options(id: &str, header: &str) -> RequestUserInputQuestion {
-        RequestUserInputQuestion {
+    fn question_with_options(id: &str, header: &str) -> ToolRequestUserInputQuestion {
+        ToolRequestUserInputQuestion {
             id: id.to_string(),
             header: header.to_string(),
             question: "Choose an option.".to_string(),
             is_other: false,
             is_secret: false,
             options: Some(vec![
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Option 1".to_string(),
                     description: "First choice.".to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Option 2".to_string(),
                     description: "Second choice.".to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Option 3".to_string(),
                     description: "Third choice.".to_string(),
                 },
@@ -1334,23 +1592,23 @@ mod tests {
         }
     }
 
-    fn question_with_options_and_other(id: &str, header: &str) -> RequestUserInputQuestion {
-        RequestUserInputQuestion {
+    fn question_with_options_and_other(id: &str, header: &str) -> ToolRequestUserInputQuestion {
+        ToolRequestUserInputQuestion {
             id: id.to_string(),
             header: header.to_string(),
             question: "Choose an option.".to_string(),
             is_other: true,
             is_secret: false,
             options: Some(vec![
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Option 1".to_string(),
                     description: "First choice.".to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Option 2".to_string(),
                     description: "Second choice.".to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Option 3".to_string(),
                     description: "Third choice.".to_string(),
                 },
@@ -1358,27 +1616,27 @@ mod tests {
         }
     }
 
-    fn question_with_wrapped_options(id: &str, header: &str) -> RequestUserInputQuestion {
-        RequestUserInputQuestion {
+    fn question_with_wrapped_options(id: &str, header: &str) -> ToolRequestUserInputQuestion {
+        ToolRequestUserInputQuestion {
             id: id.to_string(),
             header: header.to_string(),
             question: "Choose the next step for this task.".to_string(),
             is_other: false,
             is_secret: false,
             options: Some(vec![
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Discuss a code change".to_string(),
                     description:
                         "Walk through a plan, then implement it together with careful checks."
                             .to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Run targeted tests".to_string(),
                     description:
                         "Pick the most relevant crate and validate the current behavior first."
                             .to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Review the diff".to_string(),
                     description:
                         "Summarize the changes and highlight the most important risks and gaps."
@@ -1388,19 +1646,19 @@ mod tests {
         }
     }
 
-    fn question_with_very_long_option_text(id: &str, header: &str) -> RequestUserInputQuestion {
-        RequestUserInputQuestion {
+    fn question_with_very_long_option_text(id: &str, header: &str) -> ToolRequestUserInputQuestion {
+        ToolRequestUserInputQuestion {
             id: id.to_string(),
             header: header.to_string(),
             question: "Choose one option.".to_string(),
             is_other: false,
             is_secret: false,
             options: Some(vec![
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Job: running/completed/failed/expired; Run/Experiment: succeeded/failed/unknown (Recommended when triaging long-running background work and status transitions)".to_string(),
                     description: "Keep async job statuses for progress tracking and include enough context for debugging retries, stale workers, and unexpected expiration paths.".to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Add a short status model".to_string(),
                     description: "Simpler labels with less detail for quick rollouts.".to_string(),
                 },
@@ -1408,8 +1666,8 @@ mod tests {
         }
     }
 
-    fn question_with_long_scroll_options(id: &str, header: &str) -> RequestUserInputQuestion {
-        RequestUserInputQuestion {
+    fn question_with_long_scroll_options(id: &str, header: &str) -> ToolRequestUserInputQuestion {
+        ToolRequestUserInputQuestion {
             id: id.to_string(),
             header: header.to_string(),
             question:
@@ -1418,19 +1676,19 @@ mod tests {
             is_other: false,
             is_secret: false,
             options: Some(vec![
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Use Detailed Hint A (Recommended)".to_string(),
                     description: "Select this if you want a deliberately overextended explanatory hint that reads like a miniature specification, including context, rationale, expected behavior, and an explicit statement that this choice is mainly for testing how gracefully the interface wraps, truncates, and preserves readability under unusually verbose helper text conditions.".to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Use Detailed Hint B".to_string(),
                     description: "Select this if you want an equally verbose but differently phrased guidance block that emphasizes user-facing clarity, spacing tolerance, multiline wrapping, visual hierarchy interactions, and whether long descriptive metadata remains understandable when scanned quickly in a constrained layout where cognitive load is already high.".to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "Use Detailed Hint C".to_string(),
                     description: "Select this when you specifically want to verify that navigating downward will keep the currently highlighted option visible, even when previous options consume many wrapped lines and would otherwise push the selection out of the viewport.".to_string(),
                 },
-                RequestUserInputQuestionOption {
+                ToolRequestUserInputOption {
                     label: "None of the above".to_string(),
                     description:
                         "Use this only if the previous long-form options do not apply.".to_string(),
@@ -1439,8 +1697,8 @@ mod tests {
         }
     }
 
-    fn question_without_options(id: &str, header: &str) -> RequestUserInputQuestion {
-        RequestUserInputQuestion {
+    fn question_without_options(id: &str, header: &str) -> ToolRequestUserInputQuestion {
+        ToolRequestUserInputQuestion {
             id: id.to_string(),
             header: header.to_string(),
             question: "Share details.".to_string(),
@@ -1452,13 +1710,26 @@ mod tests {
 
     fn request_event(
         turn_id: &str,
-        questions: Vec<RequestUserInputQuestion>,
-    ) -> RequestUserInputEvent {
-        RequestUserInputEvent {
-            call_id: "call-1".to_string(),
+        questions: Vec<ToolRequestUserInputQuestion>,
+    ) -> ToolRequestUserInputParams {
+        ToolRequestUserInputParams {
+            thread_id: "thread-1".to_string(),
+            item_id: "call-1".to_string(),
             turn_id: turn_id.to_string(),
             questions,
+            is_blocking: true,
+            auto_resolution_ms: None,
         }
+    }
+
+    fn request_event_with_auto_resolution(
+        turn_id: &str,
+        questions: Vec<ToolRequestUserInputQuestion>,
+    ) -> ToolRequestUserInputParams {
+        let mut request = request_event(turn_id, questions);
+        request.is_blocking = false;
+        request.auto_resolution_ms = Some(60_000);
+        request
     }
 
     fn snapshot_buffer(buf: &Buffer) -> String {
@@ -1474,8 +1745,12 @@ mod tests {
     }
 
     fn render_snapshot(overlay: &RequestUserInputOverlay, area: Rect) -> String {
+        render_snapshot_at(overlay, area, Instant::now())
+    }
+
+    fn render_snapshot_at(overlay: &RequestUserInputOverlay, area: Rect, now: Instant) -> String {
         let mut buf = Buffer::empty(area);
-        overlay.render(area, &mut buf);
+        overlay.render_ui_at(area, &mut buf, now);
         snapshot_buffer(&buf)
     }
 
@@ -1485,9 +1760,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "First")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         overlay.try_consume_user_input_request(request_event(
             "turn-2",
@@ -1511,19 +1786,25 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "First")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
-        overlay.try_consume_user_input_request(RequestUserInputEvent {
-            call_id: "call-2".to_string(),
+        overlay.try_consume_user_input_request(ToolRequestUserInputParams {
+            thread_id: "thread-1".to_string(),
+            item_id: "call-2".to_string(),
             turn_id: "turn-2".to_string(),
             questions: vec![question_with_options("q2", "Second")],
+            is_blocking: true,
+            auto_resolution_ms: None,
         });
-        overlay.try_consume_user_input_request(RequestUserInputEvent {
-            call_id: "call-3".to_string(),
+        overlay.try_consume_user_input_request(ToolRequestUserInputParams {
+            thread_id: "thread-1".to_string(),
+            item_id: "call-3".to_string(),
             turn_id: "turn-3".to_string(),
             questions: vec![question_with_options("q3", "Third")],
+            is_blocking: true,
+            auto_resolution_ms: None,
         });
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
@@ -1533,14 +1814,417 @@ mod tests {
     }
 
     #[test]
+    fn auto_resolution_absent_has_no_timer() {
+        let (tx, _rx) = test_sender();
+        let overlay = RequestUserInputOverlay::new(
+            request_event("turn-1", vec![question_with_options("q1", "First")]),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let now = Instant::now();
+
+        assert_eq!(
+            overlay.auto_resolution_timing_at(now),
+            AutoResolutionTiming::Disabled
+        );
+        assert_eq!(overlay.auto_resolution_next_frame_delay_at(now), None);
+        assert_eq!(overlay.auto_resolution_countdown_text_at(now), None);
+    }
+
+    #[test]
+    fn auto_resolution_uses_is_blocking_without_auto_resolution_ms() {
+        let (tx, mut rx) = test_sender();
+        let mut request = request_event("turn-1", vec![question_with_options("q1", "First")]);
+        request.is_blocking = false;
+        assert_eq!(request.auto_resolution_ms, None);
+        let mut overlay = RequestUserInputOverlay::new(
+            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let now = Instant::now();
+        overlay.request_started_at = now;
+
+        assert_eq!(
+            overlay.auto_resolution_timing_at(now),
+            AutoResolutionTiming::HiddenGrace {
+                remaining: AUTO_RESOLUTION_HIDDEN_GRACE
+            }
+        );
+
+        let total_timeout = AUTO_RESOLUTION_HIDDEN_GRACE + AUTO_RESOLUTION_VISIBLE_COUNTDOWN;
+        let due = now + total_timeout;
+        assert!(overlay.pre_draw_tick(due));
+        assert!(overlay.done);
+
+        let event = rx.try_recv().expect("expected UserInputAnswer event");
+        let AppEvent::CodexOp(Op::UserInputAnswer { id, response }) = event else {
+            panic!("expected UserInputAnswer event");
+        };
+        assert_eq!(id, "turn-1");
+        assert_eq!(response.answers, HashMap::new());
+    }
+
+    #[test]
+    fn auto_resolution_hides_timer_during_grace_period() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event_with_auto_resolution(
+                "turn-1",
+                vec![question_with_options("q1", "First")],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let now = Instant::now();
+        overlay.request_started_at = now;
+
+        assert_eq!(
+            overlay.auto_resolution_timing_at(now),
+            AutoResolutionTiming::HiddenGrace {
+                remaining: AUTO_RESOLUTION_HIDDEN_GRACE
+            }
+        );
+        assert_eq!(
+            overlay.auto_resolution_next_frame_delay_at(now),
+            Some(AUTO_RESOLUTION_HIDDEN_GRACE)
+        );
+        assert!(
+            !render_snapshot_at(&overlay, Rect::new(0, 0, 120, 16), now).contains("auto-resolves")
+        );
+    }
+
+    #[test]
+    fn auto_resolution_visible_countdown_snapshot() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event_with_auto_resolution(
+                "turn-1",
+                vec![
+                    question_with_options("q1", "First"),
+                    question_with_options("q2", "Second"),
+                    question_with_options("q3", "Third"),
+                ],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let now = Instant::now();
+        overlay.request_started_at = now - AUTO_RESOLUTION_HIDDEN_GRACE;
+
+        insta::assert_snapshot!(
+            "request_user_input_auto_resolution_countdown",
+            render_snapshot_at(&overlay, Rect::new(0, 0, 120, 16), now)
+        );
+    }
+
+    #[test]
+    fn auto_resolution_visible_countdown_is_red() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event_with_auto_resolution(
+                "turn-1",
+                vec![question_with_options("q1", "First")],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let now = Instant::now();
+        overlay.request_started_at = now - AUTO_RESOLUTION_HIDDEN_GRACE;
+        let area = Rect::new(0, 0, 120, 16);
+        let mut buf = Buffer::empty(area);
+
+        overlay.render_ui_at(area, &mut buf, now);
+
+        let rendered = snapshot_buffer(&buf);
+        let progress_line = rendered.lines().nth(1).expect("expected progress line");
+        let countdown = "auto-resolves in 1m 00s";
+        let countdown_byte_idx = progress_line
+            .find(countdown)
+            .expect("expected countdown in progress line");
+        let countdown_x = progress_line[..countdown_byte_idx].width();
+        for offset in 0..countdown.width() {
+            assert_eq!(
+                buf[((countdown_x + offset) as u16, 1)].style().fg,
+                Some(Color::Red)
+            );
+        }
+        let prefix_byte_idx = progress_line
+            .find("Question")
+            .expect("expected question prefix in progress line");
+        let prefix_x = progress_line[..prefix_byte_idx].width();
+        assert_ne!(buf[(prefix_x as u16, 1)].style().fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn auto_resolution_expiry_emits_empty_answer() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event_with_auto_resolution(
+                "turn-1",
+                vec![question_with_options("q1", "First")],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let now = Instant::now();
+        let total_timeout = AUTO_RESOLUTION_HIDDEN_GRACE + AUTO_RESOLUTION_VISIBLE_COUNTDOWN;
+        overlay.request_started_at = now - total_timeout;
+
+        assert!(overlay.pre_draw_tick(now));
+        assert!(overlay.done);
+
+        let event = rx.try_recv().expect("expected UserInputAnswer event");
+        let AppEvent::CodexOp(Op::UserInputAnswer { id, response }) = event else {
+            panic!("expected UserInputAnswer event");
+        };
+        assert_eq!(id, "turn-1");
+        assert_eq!(response.answers, HashMap::new());
+
+        let event = rx.try_recv().expect("expected history cell event");
+        assert!(
+            matches!(event, AppEvent::InsertHistoryCell(_)),
+            "expected history cell event"
+        );
+    }
+
+    #[test]
+    fn auto_resolution_key_interaction_snoozes_timer() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event_with_auto_resolution(
+                "turn-1",
+                vec![question_with_options("q1", "First")],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let now = Instant::now();
+        let total_timeout = AUTO_RESOLUTION_HIDDEN_GRACE + AUTO_RESOLUTION_VISIBLE_COUNTDOWN;
+        overlay.request_started_at = now - AUTO_RESOLUTION_HIDDEN_GRACE;
+
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Down));
+
+        assert_eq!(
+            overlay.auto_resolution_timing_at(now + total_timeout),
+            AutoResolutionTiming::Disabled
+        );
+        assert!(!overlay.pre_draw_tick(now + total_timeout));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn auto_resolution_paste_interaction_snoozes_timer() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event_with_auto_resolution(
+                "turn-1",
+                vec![question_with_options("q1", "First")],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        let now = Instant::now();
+        let total_timeout = AUTO_RESOLUTION_HIDDEN_GRACE + AUTO_RESOLUTION_VISIBLE_COUNTDOWN;
+        overlay.request_started_at = now - AUTO_RESOLUTION_HIDDEN_GRACE;
+
+        assert!(overlay.handle_paste("notes".to_string()));
+
+        assert_eq!(
+            overlay.auto_resolution_timing_at(now + total_timeout),
+            AutoResolutionTiming::Disabled
+        );
+        assert!(!overlay.pre_draw_tick(now + total_timeout));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn auto_resolution_resets_for_queued_request() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event_with_auto_resolution(
+                "turn-1",
+                vec![question_with_options("q1", "First")],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        overlay.try_consume_user_input_request(request_event_with_auto_resolution(
+            "turn-2",
+            vec![question_with_options("q2", "Second")],
+        ));
+        let now = Instant::now();
+        let total_timeout = AUTO_RESOLUTION_HIDDEN_GRACE + AUTO_RESOLUTION_VISIBLE_COUNTDOWN;
+        overlay.request_started_at = now - total_timeout;
+
+        assert!(overlay.pre_draw_tick(now));
+
+        assert_eq!(overlay.request.turn_id, "turn-2");
+        assert!(!overlay.auto_resolution_snoozed);
+        assert_eq!(
+            overlay.auto_resolution_timing_at(now),
+            AutoResolutionTiming::HiddenGrace {
+                remaining: AUTO_RESOLUTION_HIDDEN_GRACE
+            }
+        );
+        assert!(!overlay.done);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn resolved_request_dismisses_overlay_without_emitting_events() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            ToolRequestUserInputParams {
+                thread_id: "thread-1".to_string(),
+                item_id: "call-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                questions: vec![question_with_options("q1", "First")],
+                is_blocking: true,
+                auto_resolution_ms: None,
+            },
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+
+        assert!(
+            overlay.dismiss_app_server_request(&ResolvedAppServerRequest::UserInput {
+                call_id: "call-1".to_string(),
+            })
+        );
+        assert!(overlay.done, "resolved request should close the overlay");
+        assert!(
+            rx.try_recv().is_err(),
+            "dismissing a stale request should not emit an interrupt or answer"
+        );
+    }
+
+    #[test]
+    fn resolved_current_request_advances_to_next_same_turn_prompt() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            ToolRequestUserInputParams {
+                thread_id: "thread-1".to_string(),
+                item_id: "call-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                questions: vec![question_with_options("q1", "First")],
+                is_blocking: true,
+                auto_resolution_ms: None,
+            },
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        overlay.try_consume_user_input_request(ToolRequestUserInputParams {
+            thread_id: "thread-1".to_string(),
+            item_id: "call-2".to_string(),
+            turn_id: "turn-1".to_string(),
+            questions: vec![question_with_options("q2", "Second")],
+            is_blocking: true,
+            auto_resolution_ms: None,
+        });
+
+        assert!(
+            overlay.dismiss_app_server_request(&ResolvedAppServerRequest::UserInput {
+                call_id: "call-1".to_string(),
+            })
+        );
+
+        assert!(!overlay.done, "newer same-turn prompt should stay pending");
+        assert_eq!(overlay.request.item_id, "call-2");
+        assert_eq!(overlay.request.turn_id, "turn-1");
+        assert_eq!(overlay.request.questions[0].id, "q2");
+        assert!(
+            rx.try_recv().is_err(),
+            "dismissing a stale request should not emit an interrupt or answer"
+        );
+    }
+
+    #[test]
+    fn resolved_queued_request_removes_only_that_prompt() {
+        let (tx, mut rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            ToolRequestUserInputParams {
+                thread_id: "thread-1".to_string(),
+                item_id: "call-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                questions: vec![question_with_options("q1", "First")],
+                is_blocking: true,
+                auto_resolution_ms: None,
+            },
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+        overlay.try_consume_user_input_request(ToolRequestUserInputParams {
+            thread_id: "thread-1".to_string(),
+            item_id: "call-2".to_string(),
+            turn_id: "turn-1".to_string(),
+            questions: vec![question_with_options("q2", "Second")],
+            is_blocking: true,
+            auto_resolution_ms: None,
+        });
+        overlay.try_consume_user_input_request(ToolRequestUserInputParams {
+            thread_id: "thread-1".to_string(),
+            item_id: "call-3".to_string(),
+            turn_id: "turn-1".to_string(),
+            questions: vec![question_with_options("q3", "Third")],
+            is_blocking: true,
+            auto_resolution_ms: None,
+        });
+
+        assert!(
+            overlay.dismiss_app_server_request(&ResolvedAppServerRequest::UserInput {
+                call_id: "call-2".to_string(),
+            })
+        );
+
+        assert_eq!(overlay.request.item_id, "call-1");
+        assert!(
+            rx.try_recv().is_err(),
+            "dismissing a stale queued request should not emit an event"
+        );
+        overlay.submit_answers();
+        assert_eq!(overlay.request.item_id, "call-3");
+        assert_eq!(overlay.request.questions[0].id, "q3");
+        assert!(
+            rx.try_recv().is_ok(),
+            "submitting the still-current prompt should emit an answer"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "submitting the still-current prompt should emit a history cell"
+        );
+    }
+
+    #[test]
     fn options_can_submit_empty_when_unanswered() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.submit_answers();
@@ -1560,9 +2244,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -1587,9 +2271,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -1610,13 +2294,13 @@ mod tests {
         let mut expected = HashMap::new();
         expected.insert(
             "q1".to_string(),
-            RequestUserInputAnswer {
+            ToolRequestUserInputAnswer {
                 answers: vec!["Option 1".to_string()],
             },
         );
         expected.insert(
             "q2".to_string(),
-            RequestUserInputAnswer {
+            ToolRequestUserInputAnswer {
                 answers: vec!["Option 1".to_string()],
             },
         );
@@ -1629,9 +2313,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Char('2')));
@@ -1650,9 +2334,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer().expect("answer missing");
         assert_eq!(answer.options_state.selected_idx, Some(0));
@@ -1678,9 +2362,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         assert_eq!(overlay.current_index(), 0);
@@ -1704,9 +2388,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         assert_eq!(overlay.current_index(), 0);
@@ -1728,15 +2412,39 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         assert_eq!(overlay.current_index(), 0);
         overlay.handle_key_event(KeyEvent::from(KeyCode::Right));
         assert_eq!(overlay.current_index(), 1);
         overlay.handle_key_event(KeyEvent::from(KeyCode::Left));
+        assert_eq!(overlay.current_index(), 0);
+    }
+
+    #[test]
+    fn horizontal_list_keys_move_between_questions_in_options() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![
+                    question_with_options("q1", "Pick one"),
+                    question_with_options("q2", "Pick two"),
+                ],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+
+        assert_eq!(overlay.current_index(), 0);
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(overlay.current_index(), 1);
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
         assert_eq!(overlay.current_index(), 0);
     }
 
@@ -1752,9 +2460,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let tips = overlay.footer_tips();
         let tip_texts = tips.iter().map(|tip| tip.text.as_str()).collect::<Vec<_>>();
@@ -1789,11 +2497,11 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
-        overlay.move_question(true);
+        overlay.move_question(/*next*/ true);
 
         let tips = overlay.footer_tips();
         let tip_texts = tips.iter().map(|tip| tip.text.as_str()).collect::<Vec<_>>();
@@ -1808,14 +2516,113 @@ mod tests {
     }
 
     #[test]
+    fn freeform_footer_shows_configured_submit_binding() {
+        let (tx, _rx) = test_sender();
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.composer.submit = vec![crate::key_hint::ctrl(KeyCode::Char('j'))];
+        let overlay = RequestUserInputOverlay::new_with_keymap(
+            request_event("turn-1", vec![question_without_options("q1", "Notes")]),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+            keymap,
+        );
+
+        let tips = overlay.footer_tips();
+        let tip_texts = tips.iter().map(|tip| tip.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            tip_texts,
+            vec!["ctrl + j to submit answer", "esc to interrupt"]
+        );
+    }
+
+    #[test]
+    fn freeform_footer_displays_configured_chords_without_internal_dispatch_keys() {
+        for (specs, expected_tips) in [
+            (
+                KeybindingsSpec::One(KeybindingSpec("ctrl-x enter".to_string())),
+                vec!["ctrl + x enter to submit answer", "esc to interrupt"],
+            ),
+            (
+                KeybindingsSpec::Many(vec![
+                    KeybindingSpec("ctrl-enter".to_string()),
+                    KeybindingSpec("ctrl-x enter".to_string()),
+                ]),
+                vec!["ctrl + enter to submit answer", "esc to interrupt"],
+            ),
+            (
+                KeybindingsSpec::Many(vec![
+                    KeybindingSpec("ctrl-x enter".to_string()),
+                    KeybindingSpec("ctrl-enter".to_string()),
+                ]),
+                vec!["ctrl + x enter to submit answer", "esc to interrupt"],
+            ),
+        ] {
+            let (tx, _rx) = test_sender();
+            let mut config = TuiKeymap::default();
+            config.composer.submit = Some(specs);
+            let keymap = RuntimeKeymap::from_config(&config).expect("valid submit keymap");
+            let overlay = RequestUserInputOverlay::new_with_keymap(
+                request_event("turn-1", vec![question_without_options("q1", "Notes")]),
+                tx,
+                /*has_input_focus*/ true,
+                /*enhanced_keys_supported*/ false,
+                /*disable_paste_burst*/ false,
+                keymap,
+            );
+            let tips = overlay.footer_tips();
+
+            assert_eq!(
+                tips.iter().map(|tip| tip.text.as_str()).collect::<Vec<_>>(),
+                expected_tips
+            );
+        }
+    }
+
+    #[test]
+    fn request_user_input_uses_remapped_interrupt_binding_while_notes_are_visible() {
+        let (tx, mut rx) = test_sender();
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.chat.interrupt_turn = vec![crate::key_hint::plain(KeyCode::F(12))];
+        let mut overlay = RequestUserInputOverlay::new_with_keymap(
+            request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+            keymap,
+        );
+        let answer = overlay.current_answer_mut().expect("answer missing");
+        answer.options_state.selected_idx = Some(0);
+        overlay.handle_key_event(KeyEvent::from(KeyCode::Tab));
+
+        let tips = overlay.footer_tips();
+        let tip_texts = tips.iter().map(|tip| tip.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            tip_texts,
+            vec![
+                "tab or esc to clear notes",
+                "enter to submit answer",
+                "f12 to interrupt",
+            ]
+        );
+
+        overlay.handle_key_event(KeyEvent::from(KeyCode::F(12)));
+
+        assert_eq!(overlay.done, true);
+        expect_interrupt_only(&mut rx);
+    }
+
+    #[test]
     fn tab_opens_notes_when_option_selected() {
         let (tx, _rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(1);
@@ -1838,13 +2645,13 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         assert!(matches!(overlay.focus, Focus::Notes));
-        overlay.move_question(true);
+        overlay.move_question(/*next*/ true);
 
         assert!(matches!(overlay.focus, Focus::Options));
         assert_eq!(overlay.notes_ui_visible(), false);
@@ -1862,9 +2669,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay
@@ -1872,7 +2679,7 @@ mod tests {
             .set_text_content("freeform notes".to_string(), Vec::new(), Vec::new());
         overlay.composer.move_cursor_to_end();
 
-        overlay.move_question(true);
+        overlay.move_question(/*next*/ true);
 
         assert!(matches!(overlay.focus, Focus::Options));
         assert_eq!(overlay.notes_ui_visible(), false);
@@ -1902,9 +2709,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_without_options("q1", "Notes")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
@@ -1919,9 +2726,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Esc));
@@ -1936,9 +2743,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(0);
@@ -1964,9 +2771,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(0);
@@ -1999,9 +2806,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -2021,9 +2828,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(1);
@@ -2042,9 +2849,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(0);
@@ -2068,9 +2875,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(0);
@@ -2097,9 +2904,9 @@ mod tests {
         let overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         assert_eq!(overlay.unanswered_count(), 1);
@@ -2111,9 +2918,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(0);
@@ -2133,9 +2940,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay
@@ -2162,9 +2969,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -2174,14 +2981,105 @@ mod tests {
     }
 
     #[test]
+    fn freeform_shift_enter_inserts_newline_without_advancing() {
+        let (tx, _rx) = test_sender();
+        let mut overlay = RequestUserInputOverlay::new(
+            request_event(
+                "turn-1",
+                vec![
+                    question_without_options("q1", "Notes"),
+                    question_without_options("q2", "More"),
+                ],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ true,
+            /*disable_paste_burst*/ false,
+        );
+
+        overlay
+            .composer
+            .set_text_content("Draft".to_string(), Vec::new(), Vec::new());
+        overlay.composer.move_cursor_to_end();
+
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+
+        assert_eq!(overlay.current_index(), 0);
+        assert_eq!(overlay.composer.current_text_with_pending(), "Draft\n");
+        assert_eq!(overlay.answers[0].answer_committed, false);
+    }
+
+    #[test]
+    fn freeform_uses_configured_composer_submit_binding() {
+        let (tx, _rx) = test_sender();
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.composer.submit = vec![crate::key_hint::ctrl(KeyCode::Char('j'))];
+        let mut overlay = RequestUserInputOverlay::new_with_keymap(
+            request_event(
+                "turn-1",
+                vec![
+                    question_without_options("q1", "Notes"),
+                    question_without_options("q2", "More"),
+                ],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+            keymap,
+        );
+
+        overlay
+            .composer
+            .set_text_content("Draft".to_string(), Vec::new(), Vec::new());
+        overlay.composer.move_cursor_to_end();
+
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(overlay.current_index(), 1);
+        assert_eq!(overlay.answers[0].answer_committed, true);
+    }
+
+    #[test]
+    fn freeform_submit_binding_wins_over_question_navigation() {
+        let (tx, _rx) = test_sender();
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.composer.submit = vec![crate::key_hint::ctrl(KeyCode::Char('n'))];
+        let mut overlay = RequestUserInputOverlay::new_with_keymap(
+            request_event(
+                "turn-1",
+                vec![
+                    question_without_options("q1", "Notes"),
+                    question_without_options("q2", "More"),
+                ],
+            ),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+            keymap,
+        );
+
+        overlay
+            .composer
+            .set_text_content("Draft".to_string(), Vec::new(), Vec::new());
+        overlay.composer.move_cursor_to_end();
+
+        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+
+        assert_eq!(overlay.current_index(), 1);
+        assert_eq!(overlay.answers[0].answer_committed, true);
+    }
+
+    #[test]
     fn freeform_questions_submit_empty_when_empty() {
         let (tx, mut rx) = test_sender();
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_without_options("q1", "Notes")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.submit_answers();
@@ -2200,9 +3098,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_without_options("q1", "Notes")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         overlay
             .composer
@@ -2231,9 +3129,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay
@@ -2244,12 +3142,12 @@ mod tests {
         assert_eq!(overlay.answers[0].answer_committed, true);
         let _ = rx.try_recv();
 
-        overlay.move_question(false);
+        overlay.move_question(/*next*/ false);
         overlay
             .composer
             .set_text_content("Edited".to_string(), Vec::new(), Vec::new());
         overlay.composer.move_cursor_to_end();
-        overlay.move_question(true);
+        overlay.move_question(/*next*/ true);
         assert_eq!(overlay.answers[0].answer_committed, false);
 
         overlay.submit_answers();
@@ -2268,16 +3166,16 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         {
             let answer = overlay.current_answer_mut().expect("answer missing");
             answer.options_state.selected_idx = Some(1);
         }
-        overlay.select_current_option(false);
+        overlay.select_current_option(/*committed*/ false);
         overlay
             .composer
             .set_text_content("Notes for option 2".to_string(), Vec::new(), Vec::new());
@@ -2316,9 +3214,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.handle_key_event(KeyEvent::from(KeyCode::Down));
@@ -2345,9 +3243,9 @@ mod tests {
                 vec![question_with_options_and_other("q1", "Pick one")],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         let rows = overlay.option_rows();
@@ -2401,14 +3299,14 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         let large = "x".repeat(1_500);
         overlay.composer.handle_paste(large.clone());
-        overlay.move_question(true);
+        overlay.move_question(/*next*/ true);
 
         let draft = &overlay.answers[0].draft;
         assert_eq!(draft.pending_pastes.len(), 1);
@@ -2429,9 +3327,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         let large = "x".repeat(1_200);
@@ -2454,9 +3352,9 @@ mod tests {
         let overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Area")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let area = Rect::new(0, 0, 120, 16);
         insta::assert_snapshot!(
@@ -2471,9 +3369,9 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Area")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         {
             let answer = overlay.current_answer_mut().expect("answer missing");
@@ -2494,9 +3392,9 @@ mod tests {
         let overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Area")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let area = Rect::new(0, 0, 120, 10);
         insta::assert_snapshot!(
@@ -2514,9 +3412,9 @@ mod tests {
                 vec![question_with_wrapped_options("q1", "Next Step")],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         let width = 48u16;
@@ -2542,9 +3440,9 @@ mod tests {
                 vec![question_with_wrapped_options("q1", "Next Step")],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         let width = 110u16;
@@ -2574,9 +3472,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(0);
@@ -2608,9 +3506,9 @@ mod tests {
                 vec![question_with_wrapped_options("q1", "Next Step")],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         {
@@ -2641,9 +3539,9 @@ mod tests {
                 vec![question_with_very_long_option_text("q1", "Status")],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let area = Rect::new(0, 0, 120, 18);
         insta::assert_snapshot!(
@@ -2661,9 +3559,9 @@ mod tests {
                 vec![question_with_long_scroll_options("q1", "Scroll")],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(2);
@@ -2687,9 +3585,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let answer = overlay.current_answer_mut().expect("answer missing");
         answer.options_state.selected_idx = Some(1);
@@ -2709,30 +3607,30 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event(
                 "turn-1",
-                vec![RequestUserInputQuestion {
+                vec![ToolRequestUserInputQuestion {
                     id: "q1".to_string(),
                     header: "Next Step".to_string(),
                     question: "What would you like to do next?".to_string(),
                     is_other: false,
                     is_secret: false,
                     options: Some(vec![
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Discuss a code change (Recommended)".to_string(),
                             description: "Walk through a plan and edit code together.".to_string(),
                         },
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Run tests".to_string(),
                             description: "Pick a crate and run its tests.".to_string(),
                         },
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Review a diff".to_string(),
                             description: "Summarize or review current changes.".to_string(),
                         },
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Refactor".to_string(),
                             description: "Tighten structure and remove dead code.".to_string(),
                         },
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Ship it".to_string(),
                             description: "Finalize and open a PR.".to_string(),
                         },
@@ -2740,9 +3638,9 @@ mod tests {
                 }],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         {
             let answer = overlay.current_answer_mut().expect("answer missing");
@@ -2761,30 +3659,30 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event(
                 "turn-1",
-                vec![RequestUserInputQuestion {
+                vec![ToolRequestUserInputQuestion {
                     id: "q1".to_string(),
                     header: "Next Step".to_string(),
                     question: "What would you like to do next?".to_string(),
                     is_other: false,
                     is_secret: false,
                     options: Some(vec![
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Discuss a code change (Recommended)".to_string(),
                             description: "Walk through a plan and edit code together.".to_string(),
                         },
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Run tests".to_string(),
                             description: "Pick a crate and run its tests.".to_string(),
                         },
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Review a diff".to_string(),
                             description: "Summarize or review current changes.".to_string(),
                         },
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Refactor".to_string(),
                             description: "Tighten structure and remove dead code.".to_string(),
                         },
-                        RequestUserInputQuestionOption {
+                        ToolRequestUserInputOption {
                             label: "Ship it".to_string(),
                             description: "Finalize and open a PR.".to_string(),
                         },
@@ -2792,9 +3690,9 @@ mod tests {
                 }],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         {
             let answer = overlay.current_answer_mut().expect("answer missing");
@@ -2813,13 +3711,91 @@ mod tests {
         let overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_without_options("q1", "Goal")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let area = Rect::new(0, 0, 120, 10);
         insta::assert_snapshot!(
             "request_user_input_freeform",
+            render_snapshot(&overlay, area)
+        );
+    }
+
+    #[test]
+    fn request_user_input_freeform_chord_only_submit_snapshot() {
+        let (tx, _rx) = test_sender();
+        let mut config = TuiKeymap::default();
+        config.composer.submit = Some(KeybindingsSpec::One(KeybindingSpec(
+            "ctrl-x enter".to_string(),
+        )));
+        let keymap = RuntimeKeymap::from_config(&config).expect("valid submit chord");
+        let overlay = RequestUserInputOverlay::new_with_keymap(
+            request_event("turn-1", vec![question_without_options("q1", "Goal")]),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+            keymap,
+        );
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 120, /*height*/ 10,
+        );
+        let snapshot = render_snapshot(&overlay, area)
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        insta::assert_snapshot!(snapshot, @r"
+
+          Question 1/1 (1 unanswered)
+          Share details.
+
+          › Type your answer (optional)
+
+
+
+          ctrl + x enter to submit answer | esc to interrupt
+        ");
+    }
+
+    #[test]
+    fn request_user_input_freeform_remapped_submit_snapshot() {
+        let (tx, _rx) = test_sender();
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.composer.submit = vec![crate::key_hint::ctrl(KeyCode::Char('j'))];
+        let overlay = RequestUserInputOverlay::new_with_keymap(
+            request_event("turn-1", vec![question_without_options("q1", "Goal")]),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+            keymap,
+        );
+        let area = Rect::new(0, 0, 120, 10);
+        insta::assert_snapshot!(
+            "request_user_input_freeform_remapped_submit",
+            render_snapshot(&overlay, area)
+        );
+    }
+
+    #[test]
+    fn request_user_input_freeform_remapped_interrupt_snapshot() {
+        let (tx, _rx) = test_sender();
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.chat.interrupt_turn = vec![crate::key_hint::plain(KeyCode::F(12))];
+        let overlay = RequestUserInputOverlay::new_with_keymap(
+            request_event("turn-1", vec![question_without_options("q1", "Goal")]),
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+            keymap,
+        );
+        let area = Rect::new(0, 0, 120, 10);
+        insta::assert_snapshot!(
+            "request_user_input_freeform_remapped_interrupt",
             render_snapshot(&overlay, area)
         );
     }
@@ -2836,9 +3812,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
         let area = Rect::new(0, 0, 120, 15);
         insta::assert_snapshot!(
@@ -2859,11 +3835,11 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
-        overlay.move_question(true);
+        overlay.move_question(/*next*/ true);
         let area = Rect::new(0, 0, 120, 12);
         insta::assert_snapshot!(
             "request_user_input_multi_question_last",
@@ -2883,9 +3859,9 @@ mod tests {
                 ],
             ),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
 
         overlay.open_unanswered_confirmation();
@@ -2903,11 +3879,11 @@ mod tests {
         let mut overlay = RequestUserInputOverlay::new(
             request_event("turn-1", vec![question_with_options("q1", "Pick one")]),
             tx,
-            true,
-            false,
-            false,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
         );
-        overlay.select_current_option(false);
+        overlay.select_current_option(/*committed*/ false);
         overlay.focus = Focus::Notes;
         overlay
             .composer

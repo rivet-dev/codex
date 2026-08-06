@@ -1,10 +1,13 @@
+use std::cell::Cell;
 use std::sync::Arc;
 
+use crossterm::cursor::SetCursorStyle;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 
 use crate::render::Insets;
@@ -15,6 +18,9 @@ pub trait Renderable {
     fn desired_height(&self, width: u16) -> u16;
     fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
         None
+    }
+    fn cursor_style(&self, _area: Rect) -> SetCursorStyle {
+        SetCursorStyle::DefaultUserShape
     }
 }
 
@@ -42,6 +48,13 @@ impl<'a> Renderable for RenderableItem<'a> {
         match self {
             RenderableItem::Owned(child) => child.cursor_pos(area),
             RenderableItem::Borrowed(child) => child.cursor_pos(area),
+        }
+    }
+
+    fn cursor_style(&self, area: Rect) -> SetCursorStyle {
+        match self {
+            RenderableItem::Owned(child) => child.cursor_style(area),
+            RenderableItem::Borrowed(child) => child.cursor_style(area),
         }
     }
 }
@@ -97,7 +110,7 @@ impl<'a> Renderable for Span<'a> {
 
 impl<'a> Renderable for Line<'a> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        WidgetRef::render_ref(self, area, buf);
+        Widget::render(self, area, buf);
     }
     fn desired_height(&self, _width: u16) -> u16 {
         1
@@ -127,6 +140,18 @@ impl<R: Renderable> Renderable for Option<R> {
             0
         }
     }
+
+    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        self.as_ref()
+            .and_then(|renderable| renderable.cursor_pos(area))
+    }
+
+    fn cursor_style(&self, area: Rect) -> SetCursorStyle {
+        self.as_ref()
+            .map_or(SetCursorStyle::DefaultUserShape, |renderable| {
+                renderable.cursor_style(area)
+            })
+    }
 }
 
 impl<R: Renderable> Renderable for Arc<R> {
@@ -135,6 +160,12 @@ impl<R: Renderable> Renderable for Arc<R> {
     }
     fn desired_height(&self, width: u16) -> u16 {
         self.as_ref().desired_height(width)
+    }
+    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        self.as_ref().cursor_pos(area)
+    }
+    fn cursor_style(&self, area: Rect) -> SetCursorStyle {
+        self.as_ref().cursor_style(area)
     }
 }
 
@@ -180,6 +211,19 @@ impl Renderable for ColumnRenderable<'_> {
         }
         None
     }
+
+    fn cursor_style(&self, area: Rect) -> SetCursorStyle {
+        let mut y = area.y;
+        for child in &self.children {
+            let child_area = Rect::new(area.x, y, area.width, child.desired_height(area.width))
+                .intersection(area);
+            if !child_area.is_empty() && child.cursor_pos(child_area).is_some() {
+                return child.cursor_style(child_area);
+            }
+            y += child_area.height;
+        }
+        SetCursorStyle::DefaultUserShape
+    }
 }
 
 impl<'a> ColumnRenderable<'a> {
@@ -200,20 +244,12 @@ impl<'a> ColumnRenderable<'a> {
     pub fn push(&mut self, child: impl Into<Box<dyn Renderable + 'a>>) {
         self.children.push(RenderableItem::Owned(child.into()));
     }
-
-    #[allow(dead_code)]
-    pub fn push_ref<R>(&mut self, child: &'a R)
-    where
-        R: Renderable + 'a,
-    {
-        self.children
-            .push(RenderableItem::Borrowed(child as &'a dyn Renderable));
-    }
 }
 
 pub struct FlexChild<'a> {
     flex: i32,
     child: RenderableItem<'a>,
+    cached_height: Cell<Option<(u16, u16)>>,
 }
 
 pub struct FlexRenderable<'a> {
@@ -233,6 +269,7 @@ impl<'a> FlexRenderable<'a> {
         self.children.push(FlexChild {
             flex,
             child: child.into(),
+            cached_height: Cell::new(None),
         });
     }
 
@@ -243,41 +280,63 @@ impl<'a> FlexRenderable<'a> {
         let mut allocated_rects = Vec::with_capacity(self.children.len());
         let mut child_sizes = vec![0; self.children.len()];
         let mut allocated_size = 0;
-        let mut total_flex = 0;
+        let mut flex_children = Vec::new();
 
         // 1. Allocate space to non-flex children.
         let max_size = area.height;
-        let mut last_flex_child_idx = 0;
-        for (i, FlexChild { flex, child }) in self.children.iter().enumerate() {
-            if *flex > 0 {
-                total_flex += flex;
-                last_flex_child_idx = i;
+        for (i, child) in self.children.iter().enumerate() {
+            let desired_height = if let Some((width, height)) = child.cached_height.get()
+                && width == area.width
+            {
+                height
             } else {
-                child_sizes[i] = child
-                    .desired_height(area.width)
-                    .min(max_size.saturating_sub(allocated_size));
+                let height = child.child.desired_height(area.width);
+                child.cached_height.set(Some((area.width, height)));
+                height
+            };
+            if child.flex > 0 {
+                flex_children.push((i, child.flex as u16, desired_height));
+            } else {
+                child_sizes[i] = desired_height.min(max_size.saturating_sub(allocated_size));
                 allocated_size += child_sizes[i];
             }
         }
         let free_space = max_size.saturating_sub(allocated_size);
-        // 2. Allocate space to flex children, proportional to their flex factor.
-        let mut allocated_flex_space = 0;
-        if total_flex > 0 {
-            let space_per_flex = free_space / total_flex as u16;
-            for (i, FlexChild { flex, child }) in self.children.iter().enumerate() {
-                if *flex > 0 {
-                    // Last flex child gets all the remaining space, to prevent a rounding error
-                    // from not allocating all the space.
-                    let max_child_extent = if i == last_flex_child_idx {
-                        free_space - allocated_flex_space
-                    } else {
-                        space_per_flex * *flex as u16
-                    };
-                    let child_size = child.desired_height(area.width).min(max_child_extent);
-                    child_sizes[i] = child_size;
-                    allocated_flex_space += child_size;
+        // 2. Satisfy flex children that need less than their proportional share so their unused
+        // space can be redistributed instead of leaving blank rows.
+        let mut remaining_space = free_space;
+        while !flex_children.is_empty() {
+            let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u16>();
+            let mut satisfied_any = false;
+            flex_children.retain(|(i, flex, desired_height)| {
+                let proportional_share =
+                    (u32::from(remaining_space) * u32::from(*flex) / u32::from(total_flex)) as u16;
+                if *desired_height <= proportional_share {
+                    child_sizes[*i] = *desired_height;
+                    remaining_space = remaining_space.saturating_sub(*desired_height);
+                    satisfied_any = true;
+                    false
+                } else {
+                    true
                 }
+            });
+            if !satisfied_any {
+                break;
             }
+        }
+        // 3. Divide the remaining space proportionally. The final child absorbs rounding slack.
+        let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u16>();
+        let mut allocated_flex_space = 0;
+        let last_flex_child_idx = flex_children.last().map(|(i, _, _)| *i);
+        for (i, flex, desired_height) in flex_children {
+            let max_child_extent = if Some(i) == last_flex_child_idx {
+                remaining_space.saturating_sub(allocated_flex_space)
+            } else {
+                (u32::from(remaining_space) * u32::from(flex) / u32::from(total_flex)) as u16
+            };
+            let child_size = desired_height.min(max_child_extent);
+            child_sizes[i] = child_size;
+            allocated_flex_space += child_size;
         }
 
         let mut y = area.y;
@@ -312,6 +371,19 @@ impl<'a> Renderable for FlexRenderable<'a> {
             .into_iter()
             .zip(self.children.iter())
             .find_map(|(rect, child)| child.child.cursor_pos(rect))
+    }
+
+    fn cursor_style(&self, area: Rect) -> SetCursorStyle {
+        self.allocate(area)
+            .into_iter()
+            .zip(self.children.iter())
+            .find_map(|(rect, child)| {
+                child
+                    .child
+                    .cursor_pos(rect)
+                    .map(|_| child.child.cursor_style(rect))
+            })
+            .unwrap_or(SetCursorStyle::DefaultUserShape)
     }
 }
 
@@ -363,6 +435,19 @@ impl Renderable for RowRenderable<'_> {
         }
         None
     }
+
+    fn cursor_style(&self, area: Rect) -> SetCursorStyle {
+        let mut x = area.x;
+        for (width, child) in &self.children {
+            let available_width = area.width.saturating_sub(x - area.x);
+            let child_area = Rect::new(x, area.y, (*width).min(available_width), area.height);
+            if !child_area.is_empty() && child.cursor_pos(child_area).is_some() {
+                return child.cursor_style(child_area);
+            }
+            x = x.saturating_add(*width);
+        }
+        SetCursorStyle::DefaultUserShape
+    }
 }
 
 impl<'a> RowRenderable<'a> {
@@ -373,15 +458,6 @@ impl<'a> RowRenderable<'a> {
     pub fn push(&mut self, width: u16, child: impl Into<Box<dyn Renderable>>) {
         self.children
             .push((width, RenderableItem::Owned(child.into())));
-    }
-
-    #[allow(dead_code)]
-    pub fn push_ref<R>(&mut self, width: u16, child: &'a R)
-    where
-        R: Renderable + 'a,
-    {
-        self.children
-            .push((width, RenderableItem::Borrowed(child as &'a dyn Renderable)));
     }
 }
 
@@ -402,6 +478,10 @@ impl<'a> Renderable for InsetRenderable<'a> {
     }
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         self.child.cursor_pos(area.inset(self.insets))
+    }
+
+    fn cursor_style(&self, area: Rect) -> SetCursorStyle {
+        self.child.cursor_style(area.inset(self.insets))
     }
 }
 
@@ -428,3 +508,7 @@ where
         RenderableItem::Owned(Box::new(InsetRenderable { child, insets }))
     }
 }
+
+#[cfg(test)]
+#[path = "renderable_tests.rs"]
+mod tests;

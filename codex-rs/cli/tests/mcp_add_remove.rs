@@ -1,11 +1,16 @@
 use std::path::Path;
 
 use anyhow::Result;
+use codex_config::types::McpServerTransportConfig;
 use codex_core::config::load_global_mcp_servers;
-use codex_core::config::types::McpServerTransportConfig;
 use predicates::str::contains;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
     let mut cmd = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
@@ -64,6 +69,130 @@ async fn add_and_remove_server_updates_global_config() -> Result<()> {
 
     let servers = load_global_mcp_servers(codex_home.path()).await?;
     assert!(servers.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_and_login_discover_oauth_through_configured_http_proxy() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let proxy = MockServer::start().await;
+    let resource_url = "http://cli-mcp.invalid";
+    let challenge = "Bearer resource_metadata=\"http://cli-mcp.invalid/oauth-resource\"";
+    Mock::given(method("GET"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge))
+        .mount(&proxy)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oauth-resource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "resource": format!("{resource_url}/mcp"),
+            "authorization_servers": [resource_url],
+        })))
+        .mount(&proxy)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "authorization_endpoint": format!("{resource_url}/oauth/authorize"),
+            "token_endpoint": format!("{resource_url}/oauth/token"),
+            "registration_endpoint": format!("{resource_url}/oauth/register"),
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["S256"],
+        })))
+        .mount(&proxy)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/register"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&proxy)
+        .await;
+
+    let mut add = codex_command(codex_home.path())?;
+    add.env("HTTP_PROXY", proxy.uri())
+        .env("http_proxy", proxy.uri())
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .args([
+            "-c",
+            "mcp_oauth_credentials_store=\"file\"",
+            "mcp",
+            "add",
+            "oauth",
+            "--url",
+            "http://cli-mcp.invalid/mcp",
+        ]);
+    let add_output = tokio::task::spawn_blocking(move || add.output()).await??;
+    assert!(
+        !add_output.status.success(),
+        "mock OAuth registration should terminate the automatic login"
+    );
+    assert!(
+        load_global_mcp_servers(codex_home.path())
+            .await?
+            .contains_key("oauth")
+    );
+
+    // Local OAuth login does not require the execution-environment registry.
+    std::fs::write(codex_home.path().join("environments.toml"), "invalid = [")?;
+
+    let mut login = codex_command(codex_home.path())?;
+    login
+        .env("HTTP_PROXY", proxy.uri())
+        .env("http_proxy", proxy.uri())
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .args([
+            "-c",
+            "mcp_oauth_credentials_store=\"file\"",
+            "mcp",
+            "login",
+            "oauth",
+        ]);
+    let login_output = tokio::task::spawn_blocking(move || login.output()).await??;
+    assert!(
+        !login_output.status.success(),
+        "mock OAuth registration should terminate the explicit login"
+    );
+
+    let registrations = proxy
+        .received_requests()
+        .await
+        .expect("mock proxy should record OAuth requests")
+        .iter()
+        .filter(|request| request.method == "POST" && request.url.path() == "/oauth/register")
+        .count();
+    assert_eq!(registrations, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn profile_mcp_reports_legacy_profile_migration() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[profiles.work]
+model = "gpt-5"
+"#,
+    )?;
+
+    let mut list_cmd = codex_command(codex_home.path())?;
+    list_cmd
+        .args(["--profile", "work", "mcp", "list"])
+        .assert()
+        .failure()
+        .stderr(contains("--profile `work` cannot be used"))
+        .stderr(contains("[profiles.work]"))
+        .stderr(contains("work.config.toml"));
 
     Ok(())
 }
@@ -173,6 +302,42 @@ async fn add_streamable_http_with_custom_env_var() -> Result<()> {
         other => panic!("unexpected transport: {other:?}"),
     }
     assert!(issues.enabled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_streamable_http_with_oauth_options() -> Result<()> {
+    let codex_home = TempDir::new()?;
+
+    let mut add_cmd = codex_command(codex_home.path())?;
+    add_cmd
+        .args([
+            "mcp",
+            "add",
+            "oauth-server",
+            "--url",
+            "https://example.com/mcp",
+            "--oauth-client-id",
+            "eci-prd-pub-codex-123",
+            "--oauth-resource",
+            "https://resource.example.com",
+        ])
+        .assert()
+        .success();
+
+    let servers = load_global_mcp_servers(codex_home.path()).await?;
+    let oauth_server = servers
+        .get("oauth-server")
+        .expect("oauth server should exist");
+    assert_eq!(
+        oauth_server.oauth_client_id(),
+        Some("eci-prd-pub-codex-123")
+    );
+    assert_eq!(
+        oauth_server.oauth_resource.as_deref(),
+        Some("https://resource.example.com")
+    );
+
     Ok(())
 }
 

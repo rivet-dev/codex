@@ -2,14 +2,6 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
   "definitions": {
-    "HookEventNameWire": {
-      "enum": [
-        "SessionStart",
-        "UserPromptSubmit",
-        "Stop"
-      ],
-      "type": "string"
-    },
     "SessionStartHookSpecificOutputWire": {
       "additionalProperties": false,
       "properties": {
@@ -18,7 +10,8 @@
           "type": "string"
         },
         "hookEventName": {
-          "$ref": "#/definitions/HookEventNameWire"
+          "const": "SessionStart",
+          "type": "string"
         }
       },
       "required": [

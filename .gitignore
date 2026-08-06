@@ -10,6 +10,7 @@ node_modules
 # build
 dist/
 bazel-*
+user.bazelrc
 build/
 out/
 storybook-static/
@@ -51,6 +52,7 @@ yarn-error.log*
 # env
 .env*
 !.env.example
+.venv/
 
 # package
 *.tgz
@@ -58,6 +60,8 @@ yarn-error.log*
 # ci
 .vercel/
 .netlify/
+/.tmp/sdk-ci/
+/upstream-rusty-v8/
 
 # patches
 apply_patch/
@@ -90,4 +94,3 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-

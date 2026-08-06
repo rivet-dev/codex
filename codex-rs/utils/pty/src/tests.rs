@@ -3,26 +3,28 @@ use std::path::Path;
 
 use pretty_assertions::assert_eq;
 
+use crate::ProcessDriver;
+use crate::ProcessSignal;
+use crate::SpawnedProcess;
+use crate::TerminalSize;
 use crate::combine_output_receivers;
-#[cfg(unix)]
-use crate::pipe::spawn_process_no_stdin_with_inherited_fds;
-#[cfg(unix)]
-use crate::pty::spawn_process_with_inherited_fds;
+use crate::spawn_from_driver;
 use crate::spawn_pipe_process;
 use crate::spawn_pipe_process_no_stdin;
 use crate::spawn_pty_process;
-use crate::SpawnedProcess;
-use crate::TerminalSize;
+
+#[cfg(windows)]
+#[path = "windows_tests.rs"]
+mod windows_tests;
 
 fn find_python() -> Option<String> {
     for candidate in ["python3", "python"] {
         if let Ok(output) = std::process::Command::new(candidate)
             .arg("--version")
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                return Some(candidate.to_string());
-            }
+            return Some(candidate.to_string());
         }
     }
     None
@@ -139,7 +141,6 @@ async fn collect_output_until_exit(
     }
 }
 
-#[cfg(unix)]
 async fn wait_for_output_contains(
     output_rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
     needle: &str,
@@ -361,6 +362,7 @@ async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
         &env_map,
         &None,
         TerminalSize::default(),
+        &[],
     )
     .await?;
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
@@ -417,7 +419,7 @@ async fn pipe_process_round_trips_stdin() -> anyhow::Result<()> {
         )
     };
     let env_map: HashMap<String, String> = std::env::vars().collect();
-    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None).await?;
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
     let (session, output_rx, exit_rx) = combine_spawned_output(spawned);
     let writer = session.writer_sender();
     let newline = if cfg!(windows) { "\r\n" } else { "\n" };
@@ -427,7 +429,7 @@ async fn pipe_process_round_trips_stdin() -> anyhow::Result<()> {
     drop(writer);
     session.close_stdin();
 
-    let (output, code) = collect_output_until_exit(output_rx, exit_rx, 5_000).await;
+    let (output, code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 5_000).await;
     let text = String::from_utf8_lossy(&output);
 
     assert!(
@@ -450,7 +452,7 @@ async fn pipe_process_detaches_from_parent_session() -> anyhow::Result<()> {
     let env_map: HashMap<String, String> = std::env::vars().collect();
     let script = "echo $$; sleep 0.2";
     let (program, args) = shell_command(script);
-    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None).await?;
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
 
     let (_session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
     let pid_bytes =
@@ -489,8 +491,15 @@ async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
     let (pipe_program, pipe_args) = shell_command(&echo_sleep_command("pipe_ok"));
     let (pty_program, pty_args) = shell_command(&echo_sleep_command("pty_ok"));
 
-    let pipe =
-        spawn_pipe_process(&pipe_program, &pipe_args, Path::new("."), &env_map, &None).await?;
+    let pipe = spawn_pipe_process(
+        &pipe_program,
+        &pipe_args,
+        Path::new("."),
+        &env_map,
+        &None,
+        &[],
+    )
+    .await?;
     let pty = spawn_pty_process(
         &pty_program,
         &pty_args,
@@ -498,6 +507,7 @@ async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
         &env_map,
         &None,
         TerminalSize::default(),
+        &[],
     )
     .await?;
     let (_pipe_session, pipe_output_rx, pipe_exit_rx) = combine_spawned_output(pipe);
@@ -533,10 +543,10 @@ async fn pipe_drains_stderr_without_stdout_activity() -> anyhow::Result<()> {
     let script = "import sys\nchunk = 'E' * 65536\nfor _ in range(64):\n    sys.stderr.write(chunk)\n    sys.stderr.flush()\n";
     let args = vec!["-c".to_string(), script.to_string()];
     let env_map: HashMap<String, String> = std::env::vars().collect();
-    let spawned = spawn_pipe_process(&python, &args, Path::new("."), &env_map, &None).await?;
+    let spawned = spawn_pipe_process(&python, &args, Path::new("."), &env_map, &None, &[]).await?;
     let (_session, output_rx, exit_rx) = combine_spawned_output(spawned);
 
-    let (output, code) = collect_output_until_exit(output_rx, exit_rx, 10_000).await;
+    let (output, code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 10_000).await;
 
     assert_eq!(code, 0, "expected python to exit cleanly");
     assert!(!output.is_empty(), "expected stderr output to be drained");
@@ -549,7 +559,7 @@ async fn pipe_process_can_expose_split_stdout_and_stderr() -> anyhow::Result<()>
     let env_map: HashMap<String, String> = std::env::vars().collect();
     let (program, args) = shell_command(&split_stdout_stderr_command());
     let spawned =
-        spawn_pipe_process_no_stdin(&program, &args, Path::new("."), &env_map, &None).await?;
+        spawn_pipe_process_no_stdin(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
     let SpawnedProcess {
         session: _session,
         stdout_rx,
@@ -591,6 +601,196 @@ async fn pipe_process_can_expose_split_stdout_and_stderr() -> anyhow::Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_backed_process_can_expose_split_stdout_and_stderr() -> anyhow::Result<()> {
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (stderr_tx, stderr_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+
+    let spawned = spawn_from_driver(ProcessDriver {
+        writer_tx,
+        stdout_rx: stdout_driver_rx,
+        stderr_rx: Some(stderr_driver_rx),
+        exit_rx,
+        terminator: None,
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+    let error = spawned
+        .session
+        .signal(ProcessSignal::Interrupt)
+        .expect_err("interrupting a driver without a terminator should remain unsupported");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+
+    let SpawnedProcess {
+        session: _session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    } = spawned;
+    let stdout_task = tokio::spawn(async move { collect_split_output(stdout_rx).await });
+    let stderr_task = tokio::spawn(async move { collect_split_output(stderr_rx).await });
+
+    stdout_tx.send(b"driver-out".to_vec())?;
+    stderr_tx.send(b"driver-err".to_vec())?;
+    drop(stdout_tx);
+    drop(stderr_tx);
+    exit_tx.send(0).expect("send exit code");
+
+    let timeout = tokio::time::Duration::from_secs(2);
+    let code = tokio::time::timeout(timeout, exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for driver exit"))?
+        .unwrap_or(-1);
+    let stdout = tokio::time::timeout(timeout, stdout_task)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stdout"))??;
+    let stderr = tokio::time::timeout(timeout, stderr_task)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stderr"))??;
+
+    assert_eq!(stdout, b"driver-out".to_vec());
+    assert_eq!(stderr, b"driver-err".to_vec());
+    assert_eq!(code, 0);
+
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_backed_interrupt_terminates_once() {
+    let terminations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let callback_terminations = std::sync::Arc::clone(&terminations);
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (_stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+    let (_exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let spawned = spawn_from_driver(ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: Some(Box::new(move || {
+            callback_terminations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })),
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+
+    spawned
+        .session
+        .signal(ProcessSignal::Interrupt)
+        .expect("interrupt should terminate the driver-backed process");
+    drop(spawned.session);
+
+    assert_eq!(terminations.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_backed_process_can_resize_via_resizer_hook() -> anyhow::Result<()> {
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (_stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let (size_tx, size_rx) = tokio::sync::oneshot::channel::<TerminalSize>();
+
+    let size_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(size_tx)));
+    let spawned = spawn_from_driver(ProcessDriver {
+        writer_tx,
+        stdout_rx: stdout_driver_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: Some(Box::new(|| {})),
+        writer_handle: None,
+        resizer: Some(Box::new(move |size| {
+            if let Ok(mut guard) = size_tx.lock()
+                && let Some(size_tx) = guard.take()
+            {
+                let _ = size_tx.send(size);
+            }
+            Ok(())
+        })),
+        #[cfg(windows)]
+        tty: true,
+    });
+
+    let error = spawned
+        .session
+        .signal(ProcessSignal::Interrupt)
+        .expect_err("interrupting a PTY-backed driver should remain unsupported");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+
+    spawned.session.resize(TerminalSize {
+        rows: 40,
+        cols: 120,
+    })?;
+    exit_tx.send(0).expect("send exit code");
+
+    let resized = tokio::time::timeout(tokio::time::Duration::from_secs(2), size_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for resize"))?
+        .expect("receive resized terminal size");
+    assert_eq!(
+        resized,
+        TerminalSize {
+            rows: 40,
+            cols: 120
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_backed_process_drains_output_that_arrives_after_exit_signal() -> anyhow::Result<()>
+{
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (stdout_tx, stdout_driver_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+
+    let spawned = spawn_from_driver(ProcessDriver {
+        writer_tx,
+        stdout_rx: stdout_driver_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: None,
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+
+    let SpawnedProcess {
+        session: _session,
+        stdout_rx,
+        stderr_rx: _stderr_rx,
+        exit_rx,
+    } = spawned;
+    let stdout_task = tokio::spawn(async move { collect_split_output(stdout_rx).await });
+
+    exit_tx.send(0).expect("send exit code");
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    stdout_tx.send(b"tail".to_vec())?;
+    drop(stdout_tx);
+
+    let timeout = tokio::time::Duration::from_secs(2);
+    let code = tokio::time::timeout(timeout, exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for driver exit"))?
+        .unwrap_or(-1);
+    let stdout = tokio::time::timeout(timeout, stdout_task)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting to drain driver stdout"))??;
+
+    assert_eq!(stdout, b"tail".to_vec());
+    assert_eq!(code, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipe_terminate_aborts_detached_readers() -> anyhow::Result<()> {
     if !setsid_available() {
         eprintln!("setsid not available; skipping pipe_terminate_aborts_detached_readers");
@@ -601,7 +801,7 @@ async fn pipe_terminate_aborts_detached_readers() -> anyhow::Result<()> {
     let script =
         "setsid sh -c 'i=0; while [ $i -lt 200 ]; do echo tick; sleep 0.01; i=$((i+1)); done' &";
     let (program, args) = shell_command(script);
-    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None).await?;
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
     let (session, mut output_rx, _exit_rx) = combine_spawned_output(spawned);
 
     let _ = tokio::time::timeout(tokio::time::Duration::from_millis(500), output_rx.recv())
@@ -641,11 +841,12 @@ async fn pty_terminate_kills_background_children_in_same_process_group() -> anyh
         &env_map,
         &None,
         TerminalSize::default(),
+        &[],
     )
     .await?;
     let (session, mut output_rx, _exit_rx) = combine_spawned_output(spawned);
 
-    let bg_pid = match wait_for_marker_pid(&mut output_rx, marker, 2_000).await {
+    let bg_pid = match wait_for_marker_pid(&mut output_rx, marker, /*timeout_ms*/ 2_000).await {
         Ok(pid) => pid,
         Err(err) => {
             session.terminate();
@@ -659,7 +860,7 @@ async fn pty_terminate_kills_background_children_in_same_process_group() -> anyh
 
     session.terminate();
 
-    let exited = wait_for_process_exit(bg_pid, 3_000).await?;
+    let exited = wait_for_process_exit(bg_pid, /*timeout_ms*/ 3_000).await?;
     if !exited {
         let _ = unsafe { libc::kill(bg_pid, libc::SIGKILL) };
     }
@@ -695,7 +896,7 @@ async fn pty_spawn_can_preserve_inherited_fds() -> anyhow::Result<()> {
     );
 
     let script = "printf __preserved__ >\"/dev/fd/$PRESERVED_FD\"";
-    let spawned = spawn_process_with_inherited_fds(
+    let spawned = spawn_pty_process(
         "/bin/sh",
         &["-c".to_string(), script.to_string()],
         Path::new("."),
@@ -709,7 +910,7 @@ async fn pty_spawn_can_preserve_inherited_fds() -> anyhow::Result<()> {
     drop(write_end);
 
     let (_session, output_rx, exit_rx) = combine_spawned_output(spawned);
-    let (_, code) = collect_output_until_exit(output_rx, exit_rx, 2_000).await;
+    let (_, code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 2_000).await;
     assert_eq!(code, 0, "expected preserved-fd PTY child to exit cleanly");
 
     let mut pipe_output = String::new();
@@ -747,7 +948,7 @@ async fn pty_preserving_inherited_fds_keeps_python_repl_running() -> anyhow::Res
         preserved_fd.as_raw_fd().to_string(),
     );
 
-    let spawned = spawn_process_with_inherited_fds(
+    let spawned = spawn_pty_process(
         &python,
         &[],
         Path::new("."),
@@ -763,14 +964,19 @@ async fn pty_preserving_inherited_fds_keeps_python_repl_running() -> anyhow::Res
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
     let writer = session.writer_sender();
     let newline = "\n";
-    let mut output =
-        wait_for_python_repl_ready_via_probe(&writer, &mut output_rx, 5_000, newline).await?;
+    let mut output = wait_for_python_repl_ready_via_probe(
+        &writer,
+        &mut output_rx,
+        /*timeout_ms*/ 5_000,
+        newline,
+    )
+    .await?;
     let marker = "__codex_preserved_py_pid:";
     writer
         .send(format!("import os; print('{marker}' + str(os.getpid())){newline}").into_bytes())
         .await?;
 
-    let python_pid = match wait_for_marker_pid(&mut output_rx, marker, 2_000).await {
+    let python_pid = match wait_for_marker_pid(&mut output_rx, marker, /*timeout_ms*/ 2_000).await {
         Ok(pid) => pid,
         Err(err) => {
             session.terminate();
@@ -783,7 +989,8 @@ async fn pty_preserving_inherited_fds_keeps_python_repl_running() -> anyhow::Res
     );
 
     writer.send(format!("exit(){newline}").into_bytes()).await?;
-    let (remaining_output, code) = collect_output_until_exit(output_rx, exit_rx, 5_000).await;
+    let (remaining_output, code) =
+        collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 5_000).await;
     output.extend_from_slice(&remaining_output);
 
     assert_eq!(code, 0, "expected python to exit cleanly");
@@ -807,7 +1014,7 @@ async fn pty_spawn_with_inherited_fds_reports_exec_failures() -> anyhow::Result<
     let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
 
     let env_map: HashMap<String, String> = std::env::vars().collect();
-    let spawn_result = spawn_process_with_inherited_fds(
+    let spawn_result = spawn_pty_process(
         "/definitely/missing/command",
         &[],
         Path::new("."),
@@ -855,9 +1062,8 @@ async fn pty_spawn_with_inherited_fds_supports_resize() -> anyhow::Result<()> {
     let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
 
     let env_map: HashMap<String, String> = std::env::vars().collect();
-    let script =
-        "stty -echo; printf 'start:%s\\n' \"$(stty size)\"; IFS= read _line; printf 'after:%s\\n' \"$(stty size)\"";
-    let spawned = spawn_process_with_inherited_fds(
+    let script = "stty -echo; printf 'start:%s\\n' \"$(stty size)\"; IFS= read _line; printf 'after:%s\\n' \"$(stty size)\"";
+    let spawned = spawn_pty_process(
         "/bin/sh",
         &["-c".to_string(), script.to_string()],
         Path::new("."),
@@ -873,7 +1079,12 @@ async fn pty_spawn_with_inherited_fds_supports_resize() -> anyhow::Result<()> {
 
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
     let writer = session.writer_sender();
-    let mut output = wait_for_output_contains(&mut output_rx, "start:31 101\r\n", 5_000).await?;
+    let mut output = wait_for_output_contains(
+        &mut output_rx,
+        "start:31 101\r\n",
+        /*timeout_ms*/ 5_000,
+    )
+    .await?;
 
     session.resize(TerminalSize {
         rows: 45,
@@ -882,7 +1093,8 @@ async fn pty_spawn_with_inherited_fds_supports_resize() -> anyhow::Result<()> {
     writer.send(b"go\n".to_vec()).await?;
     session.close_stdin();
 
-    let (remaining_output, code) = collect_output_until_exit(output_rx, exit_rx, 5_000).await;
+    let (remaining_output, code) =
+        collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 5_000).await;
     output.extend_from_slice(&remaining_output);
     let text = String::from_utf8_lossy(&output);
     let normalized = text.replace("\r\n", "\n");
@@ -922,7 +1134,7 @@ async fn pipe_spawn_no_stdin_can_preserve_inherited_fds() -> anyhow::Result<()> 
     );
 
     let script = "printf __pipe_preserved__ >\"/dev/fd/$PRESERVED_FD\"";
-    let spawned = spawn_process_no_stdin_with_inherited_fds(
+    let spawned = spawn_pipe_process_no_stdin(
         "/bin/sh",
         &["-c".to_string(), script.to_string()],
         Path::new("."),
@@ -935,7 +1147,7 @@ async fn pipe_spawn_no_stdin_can_preserve_inherited_fds() -> anyhow::Result<()> 
     drop(write_end);
 
     let (_session, output_rx, exit_rx) = combine_spawned_output(spawned);
-    let (_, code) = collect_output_until_exit(output_rx, exit_rx, 2_000).await;
+    let (_, code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 2_000).await;
     assert_eq!(code, 0, "expected preserved-fd pipe child to exit cleanly");
 
     let mut pipe_output = String::new();

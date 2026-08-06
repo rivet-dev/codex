@@ -10,20 +10,84 @@ use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::models::is_audio_close_tag_text;
+use codex_protocol::models::is_audio_open_tag_text;
 use codex_protocol::models::is_image_close_tag_text;
 use codex_protocol::models::is_image_open_tag_text;
+use codex_protocol::models::is_local_audio_close_tag_text;
+use codex_protocol::models::is_local_audio_open_tag_text;
 use codex_protocol::models::is_local_image_close_tag_text;
 use codex_protocol::models::is_local_image_open_tag_text;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
+use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
+use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
+use codex_protocol::protocol::ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::REALTIME_CONVERSATION_OPEN_TAG;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::TOOLS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::contextual_user_message::is_contextual_user_fragment;
-use crate::contextual_user_message::parse_visible_hook_prompt_message;
+use crate::context::is_contextual_user_fragment;
+use crate::context::parse_visible_hook_prompt_message;
 use crate::web_search::web_search_action_detail;
+
+const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
+    "<permissions instructions>",
+    "<model_switch>",
+    APPS_INSTRUCTIONS_OPEN_TAG,
+    COLLABORATION_MODE_OPEN_TAG,
+    MULTI_AGENT_MODE_OPEN_TAG,
+    ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG,
+    "<git_attribution>",
+    PLUGINS_INSTRUCTIONS_OPEN_TAG,
+    REALTIME_CONVERSATION_OPEN_TAG,
+    SKILLS_INSTRUCTIONS_OPEN_TAG,
+    TOOLS_OPEN_TAG,
+    "<personality_spec>",
+    // Keep recognizing token-budget wrappers persisted by older versions.
+    "<token_budget>",
+    CONTEXT_WINDOW_OPEN_TAG,
+    CONTEXT_WINDOW_GUIDANCE_OPEN_TAG,
+    "<rollout_budget>",
+];
 
 pub(crate) fn is_contextual_user_message_content(message: &[ContentItem]) -> bool {
     message.iter().any(is_contextual_user_fragment)
+}
+
+/// Returns true when a developer message contains any rollback-trimmable contextual fragment.
+///
+/// `build_initial_context` can bundle these fragments together with persistent developer text in a
+/// single developer message, so callers that care about invalidating a stored reference baseline
+/// should pair this with `has_non_contextual_dev_message_content`.
+pub(crate) fn is_contextual_dev_message_content(message: &[ContentItem]) -> bool {
+    message.iter().any(is_contextual_dev_fragment)
+}
+
+/// Returns true when a developer message contains any fragment that is not part of the
+/// rollback-trimmable contextual prefix set.
+pub(crate) fn has_non_contextual_dev_message_content(message: &[ContentItem]) -> bool {
+    message
+        .iter()
+        .any(|content_item| !is_contextual_dev_fragment(content_item))
+}
+
+fn is_contextual_dev_fragment(content_item: &ContentItem) -> bool {
+    let ContentItem::InputText { text } = content_item else {
+        return false;
+    };
+
+    let trimmed = text.trim_start();
+    CONTEXTUAL_DEVELOPER_PREFIXES.iter().any(|prefix| {
+        trimmed
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+    })
 }
 
 fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
@@ -36,12 +100,19 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
     for (idx, content_item) in message.iter().enumerate() {
         match content_item {
             ContentItem::InputText { text } => {
-                if (is_local_image_open_tag_text(text) || is_image_open_tag_text(text))
-                    && (matches!(message.get(idx + 1), Some(ContentItem::InputImage { .. })))
+                let is_image_label = ((is_local_image_open_tag_text(text)
+                    || is_image_open_tag_text(text))
+                    && matches!(message.get(idx + 1), Some(ContentItem::InputImage { .. })))
                     || (idx > 0
                         && (is_local_image_close_tag_text(text) || is_image_close_tag_text(text))
-                        && matches!(message.get(idx - 1), Some(ContentItem::InputImage { .. })))
-                {
+                        && matches!(message.get(idx - 1), Some(ContentItem::InputImage { .. })));
+                let is_audio_label = ((is_local_audio_open_tag_text(text)
+                    || is_audio_open_tag_text(text))
+                    && matches!(message.get(idx + 1), Some(ContentItem::InputAudio { .. })))
+                    || (idx > 0
+                        && (is_local_audio_close_tag_text(text) || is_audio_close_tag_text(text))
+                        && matches!(message.get(idx - 1), Some(ContentItem::InputAudio { .. })));
+                if is_image_label || is_audio_label {
                     continue;
                 }
                 content.push(UserInput::Text {
@@ -50,9 +121,15 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
                     text_elements: Vec::new(),
                 });
             }
-            ContentItem::InputImage { image_url } => {
+            ContentItem::InputImage { image_url, detail } => {
                 content.push(UserInput::Image {
                     image_url: image_url.clone(),
+                    detail: *detail,
+                });
+            }
+            ContentItem::InputAudio { audio_url } => {
+                content.push(UserInput::Audio {
+                    audio_url: audio_url.clone(),
                 });
             }
             ContentItem::OutputText { text } => {
@@ -65,14 +142,14 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
 }
 
 fn parse_agent_message(
-    id: Option<&String>,
+    id: Option<&str>,
     message: &[ContentItem],
     phase: Option<MessagePhase>,
 ) -> AgentMessageItem {
     let mut content: Vec<AgentMessageContent> = Vec::new();
     for content_item in message.iter() {
         match content_item {
-            ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                 content.push(AgentMessageContent::Text { text: text.clone() });
             }
             _ => {
@@ -83,7 +160,9 @@ fn parse_agent_message(
             }
         }
     }
-    let id = id.cloned().unwrap_or_else(|| Uuid::new_v4().to_string());
+    let id = id
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     AgentMessageItem {
         id,
         content,
@@ -101,11 +180,11 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
             phase,
             ..
         } => match role.as_str() {
-            "user" => parse_visible_hook_prompt_message(id.as_ref(), content)
+            "user" => parse_visible_hook_prompt_message(id.as_deref(), content)
                 .map(TurnItem::HookPrompt)
                 .or_else(|| parse_user_message(content).map(TurnItem::UserMessage)),
             "assistant" => Some(TurnItem::AgentMessage(parse_agent_message(
-                id.as_ref(),
+                id.as_deref(),
                 content,
                 phase.clone(),
             ))),
@@ -134,7 +213,7 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
                 })
                 .collect();
             Some(TurnItem::Reasoning(ReasoningItem {
-                id: id.clone(),
+                id: id.as_deref().unwrap_or_default().to_string(),
                 summary_text,
                 raw_content,
             }))
@@ -145,9 +224,10 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
                 None => (WebSearchAction::Other, String::new()),
             };
             Some(TurnItem::WebSearch(WebSearchItem {
-                id: id.clone().unwrap_or_default(),
+                id: id.as_deref().unwrap_or_default().to_string(),
                 query,
                 action,
+                results: None,
             }))
         }
         ResponseItem::ImageGenerationCall {
@@ -155,9 +235,10 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
             status,
             revised_prompt,
             result,
+            ..
         } => Some(TurnItem::ImageGeneration(
             codex_protocol::items::ImageGenerationItem {
-                id: id.clone(),
+                id: id.as_deref()?.to_string(),
                 status: status.clone(),
                 revised_prompt: revised_prompt.clone(),
                 result: result.clone(),

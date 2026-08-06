@@ -65,17 +65,6 @@ impl FrameRequester {
             frame_schedule_tx: tx,
         }
     }
-
-    /// Create a requester and expose its raw schedule queue for assertions.
-    pub(crate) fn test_observable() -> (Self, mpsc::UnboundedReceiver<Instant>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (
-            FrameRequester {
-                frame_schedule_tx: tx,
-            },
-            rx,
-        )
-    }
 }
 
 /// A scheduler for coalescing frame draw requests and notifying the TUI event loop.
@@ -143,6 +132,19 @@ mod tests {
     use super::*;
     use tokio::time;
     use tokio_util::time::FutureExt;
+
+    impl FrameRequester {
+        /// Create a frame requester and expose its request channel for deterministic tests.
+        pub(crate) fn test_channel() -> (Self, mpsc::UnboundedReceiver<Instant>) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (
+                FrameRequester {
+                    frame_schedule_tx: tx,
+                },
+                rx,
+            )
+        }
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_schedule_frame_immediate_triggers_once() {

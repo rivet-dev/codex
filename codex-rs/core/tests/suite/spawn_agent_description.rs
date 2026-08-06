@@ -1,14 +1,16 @@
 #![cfg(not(target_os = "windows"))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
-use codex_core::CodexAuth;
-use codex_core::models_manager::manager::ModelsManager;
-use codex_core::models_manager::manager::RefreshStrategy;
+use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
+use codex_login::CodexAuth;
+use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -19,31 +21,31 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::namespace_child_tool;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use serde_json::Value;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use test_case::test_case;
 use tokio::time::sleep;
 
+const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
+const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
 const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 
 fn spawn_agent_description(body: &Value) -> Option<String> {
-    body.get("tools")
-        .and_then(Value::as_array)
-        .and_then(|tools| {
-            tools.iter().find_map(|tool| {
-                if tool.get("name").and_then(Value::as_str) == Some(SPAWN_AGENT_TOOL_NAME) {
-                    tool.get("description")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                } else {
-                    None
-                }
-            })
-        })
+    namespace_child_tool(body, MULTI_AGENT_V1_NAMESPACE, SPAWN_AGENT_TOOL_NAME)
+        .and_then(|tool| tool.get("description"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn spawn_agent_exposes_agent_type(body: &Value, namespace: &str) -> bool {
+    namespace_child_tool(body, namespace, SPAWN_AGENT_TOOL_NAME)
+        .and_then(|tool| tool.pointer("/parameters/properties/agent_type"))
+        .is_some()
 }
 
 fn test_model_info(
@@ -53,6 +55,7 @@ fn test_model_info(
     visibility: ModelVisibility,
     default_reasoning_level: ReasoningEffort,
     supported_reasoning_levels: Vec<ReasoningEffortPreset>,
+    service_tiers: Vec<ModelServiceTier>,
 ) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
@@ -66,31 +69,46 @@ fn test_model_info(
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        use_responses_lite: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
+        service_tiers,
+        default_service_tier: None,
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
-        supports_reasoning_summaries: false,
+        include_skills_usage_instructions: false,
+        supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
+        max_context_window: None,
         auto_compact_token_limit: None,
+        comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
     }
 }
 
-async fn wait_for_model_available(manager: &Arc<ModelsManager>, slug: &str) {
+async fn wait_for_model_available(manager: &SharedModelsManager, slug: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let available_models = manager.list_models(RefreshStrategy::Online).await;
+        let available_models = manager
+            .list_models(
+                RefreshStrategy::Online,
+                codex_core::test_support::default_http_client_factory(),
+            )
+            .await;
         if available_models.iter().any(|model| model.model == slug) {
             return;
         }
@@ -120,10 +138,19 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
                             description: "Quick scan".to_string(),
                         },
                         ReasoningEffortPreset {
+                            effort: ReasoningEffort::Medium,
+                            description: "Balanced".to_string(),
+                        },
+                        ReasoningEffortPreset {
                             effort: ReasoningEffort::High,
                             description: "Deep dive".to_string(),
                         },
                     ],
+                    vec![ModelServiceTier {
+                        id: "priority".to_string(),
+                        name: "Fast".to_string(),
+                        description: "1.5x speed, increased usage".to_string(),
+                    }],
                 ),
                 test_model_info(
                     "hidden-model",
@@ -135,6 +162,7 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
                         effort: ReasoningEffort::Low,
                         description: "Not visible".to_string(),
                     }],
+                    Vec::new(),
                 ),
             ],
         },
@@ -154,6 +182,7 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
                 .features
                 .enable(Feature::Collab)
                 .expect("test config should allow feature update");
+            config.multi_agent_v2.hide_spawn_agent_metadata = false;
         });
     let test = builder.build(&server).await?;
     wait_for_model_available(&test.thread_manager.get_models_manager(), "visible-model").await;
@@ -165,38 +194,169 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
         spawn_agent_description(&body).expect("spawn_agent description should be present");
 
     assert!(
-        description.contains("- Visible Model (`visible-model`): Fast and capable"),
+        description.contains("- `visible-model`: Fast and capable"),
         "expected visible model summary in spawn_agent description: {description:?}"
     );
     assert!(
-        description.contains("Default reasoning effort: medium."),
+        description
+            .contains("Available model overrides (optional; inherited parent model is preferred):"),
+        "expected model choices to be framed as overrides in spawn_agent description: {description:?}"
+    );
+    assert!(
+        description.contains(
+            "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed."
+        ),
+        "expected inherited-model guidance in spawn_agent description: {description:?}"
+    );
+    assert!(
+        description.contains(
+            "Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason."
+        ),
+        "expected model override usage guidance in spawn_agent description: {description:?}"
+    );
+    assert!(
+        description.contains("Reasoning efforts: low, medium (default), high."),
         "expected default reasoning effort in spawn_agent description: {description:?}"
     );
     assert!(
-        description.contains("low (Quick scan), high (Deep dive)."),
-        "expected reasoning efforts in spawn_agent description: {description:?}"
+        description.contains("Service tiers: priority."),
+        "expected service tier guidance in spawn_agent description: {description:?}"
     );
     assert!(
-        !description.contains("Hidden Model"),
+        !description.contains("hidden-model"),
         "hidden picker model should be omitted from spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
-            "Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work."
+            "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work."
         ),
         "expected explicit authorization rule in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
             "Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn."
-        ),
-        "expected non-authorization clarification in spawn_agent description: {description:?}"
+        ) && description.contains("### When to delegate vs. do the subtask yourself"),
+        "expected delegation decision guidance in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
             "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
         ),
         "expected agent-role clarification in spawn_agent description: {description:?}"
+    );
+    assert!(
+        !description.contains("A mini model can solve many tasks faster than the main model."),
+        "spawn_agent description should not encourage choosing a smaller model by default: {description:?}"
+    );
+
+    Ok(())
+}
+
+#[test_case(false, false, MULTI_AGENT_V1_NAMESPACE; "v1 hides agent type without roles")]
+#[test_case(true, true, "collaboration"; "v2 exposes agent type with a role")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_agent_roles_control_spawn_agent_type(
+    multi_agent_v2: bool,
+    has_agent_role: bool,
+    namespace: &str,
+) -> Result<()> {
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            if multi_agent_v2 {
+                config
+                    .features
+                    .enable(Feature::MultiAgentV2)
+                    .expect("test config should allow feature update");
+            } else {
+                config
+                    .features
+                    .disable(Feature::MultiAgentV2)
+                    .expect("test config should allow feature update");
+            }
+            if has_agent_role {
+                config.agent_roles.insert(
+                    "researcher".to_string(),
+                    AgentRoleConfig {
+                        description: Some("Research role".to_string()),
+                        config_file: None,
+                        nickname_candidates: None,
+                    },
+                );
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("hello").await?;
+
+    assert_eq!(
+        spawn_agent_exposes_agent_type(&response.single_request().body_json(), namespace),
+        has_agent_role
+    );
+    Ok(())
+}
+
+#[test_case(true, false; "wait agent remains available without clock sleep")]
+#[test_case(true, true; "wait agent remains available with clock sleep")]
+#[test_case(false, false; "wait agent can be disabled without clock sleep")]
+#[test_case(false, true; "wait agent can be disabled with clock sleep")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_v2_wait_agent_tool_follows_configuration(
+    wait_agent_enabled: bool,
+    sleep_tool_enabled: bool,
+) -> Result<()> {
+    let current_time_reminder = if sleep_tool_enabled {
+        r#"
+[features.current_time_reminder]
+enabled = true
+sleep_tool = true
+"#
+    } else {
+        ""
+    };
+    let config_toml = format!(
+        r#"
+[features.multi_agent_v2]
+enabled = true
+wait_agent_enabled = {wait_agent_enabled}
+{current_time_reminder}"#
+    );
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_pre_build_hook(move |home| {
+            std::fs::write(home.join("config.toml"), &config_toml)
+                .expect("write multi-agent configuration");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("hello").await?;
+
+    let request = response.single_request();
+    let body = request.body_json();
+    assert!(namespace_child_tool(&body, MULTI_AGENT_V2_NAMESPACE, SPAWN_AGENT_TOOL_NAME).is_some());
+    assert_eq!(
+        namespace_child_tool(&body, MULTI_AGENT_V2_NAMESPACE, "wait_agent").is_some(),
+        wait_agent_enabled
+    );
+    assert_eq!(
+        namespace_child_tool(&body, "clock", "sleep").is_some(),
+        sleep_tool_enabled
     );
 
     Ok(())

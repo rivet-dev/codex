@@ -9,7 +9,6 @@
 //!
 //! This allows us to ship a completely separate set of functionality as part
 //! of the `codex-exec` binary.
-
 #[cfg(target_os = "wasi")]
 fn main() -> anyhow::Result<()> {
     codex_exec::wasi_stub_main()
@@ -39,62 +38,13 @@ fn main() -> anyhow::Result<()> {
         let mut inner = top_cli.inner;
         inner
             .config_overrides
-            .raw_overrides
-            .splice(0..0, top_cli.config_overrides.raw_overrides);
+            .prepend_root_overrides(top_cli.config_overrides);
 
         run_main(inner, arg0_paths).await?;
         Ok(())
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use clap::Parser;
-    use codex_exec::Cli;
-    use codex_utils_cli::CliConfigOverrides;
-    use pretty_assertions::assert_eq;
-
-    #[derive(Parser, Debug)]
-    struct TopCli {
-        #[clap(flatten)]
-        config_overrides: CliConfigOverrides,
-
-        #[clap(flatten)]
-        inner: Cli,
-    }
-
-    #[test]
-    fn top_cli_parses_resume_prompt_after_config_flag() {
-        const PROMPT: &str = "echo resume-with-global-flags-after-subcommand";
-        let cli = TopCli::parse_from([
-            "codex-exec",
-            "resume",
-            "--last",
-            "--json",
-            "--model",
-            "gpt-5.2-codex",
-            "--config",
-            "reasoning_level=xhigh",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--skip-git-repo-check",
-            PROMPT,
-        ]);
-
-        let Some(codex_exec::Command::Resume(args)) = cli.inner.command else {
-            panic!("expected resume command");
-        };
-        let effective_prompt = args.prompt.clone().or_else(|| {
-            if args.last {
-                args.session_id.clone()
-            } else {
-                None
-            }
-        });
-        assert_eq!(effective_prompt.as_deref(), Some(PROMPT));
-        assert_eq!(cli.config_overrides.raw_overrides.len(), 1);
-        assert_eq!(
-            cli.config_overrides.raw_overrides[0],
-            "reasoning_level=xhigh"
-        );
-    }
-}
+#[cfg(all(test, not(target_os = "wasi")))]
+#[path = "main_tests.rs"]
+mod tests;

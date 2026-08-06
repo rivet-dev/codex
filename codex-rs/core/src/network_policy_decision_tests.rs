@@ -1,5 +1,6 @@
 use super::*;
 use codex_network_proxy::BlockedRequest;
+use codex_network_proxy::NetworkDecisionSource;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyRuleAction;
 use pretty_assertions::assert_eq;
@@ -160,6 +161,7 @@ fn denied_network_policy_message_requires_deny_decision() {
         method: Some("GET".to_string()),
         mode: None,
         protocol: "http".to_string(),
+        execution_id: None,
         decision: Some("ask".to_string()),
         source: Some("decider".to_string()),
         port: Some(80),
@@ -177,6 +179,7 @@ fn denied_network_policy_message_for_denylist_block_is_explicit() {
         method: Some("GET".to_string()),
         mode: None,
         protocol: "http".to_string(),
+        execution_id: None,
         decision: Some("deny".to_string()),
         source: Some("baseline_policy".to_string()),
         port: Some(80),

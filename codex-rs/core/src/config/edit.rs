@@ -1,9 +1,11 @@
-use crate::config::types::McpServerConfig;
-use crate::config::types::Notice;
 use crate::path_utils::resolve_symlink_write_paths;
 use crate::path_utils::write_atomically;
 use anyhow::Context;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::types::McpServerConfig;
+use codex_config::types::ResumeCwdMode;
+use codex_config::types::SessionPickerViewMode;
+use codex_config::types::ToolSuggestDisabledTool;
 use codex_features::FEATURES;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
@@ -11,6 +13,7 @@ use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::task;
@@ -19,6 +22,10 @@ use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
 use toml_edit::Table as TomlTable;
 use toml_edit::value;
+
+const NOTICE_TABLE_KEY: &str = "notice";
+
+mod document_helpers;
 
 /// Discrete config mutations supported by the persistence engine.
 #[derive(Clone, Debug)]
@@ -29,7 +36,7 @@ pub enum ConfigEdit {
         effort: Option<ReasoningEffort>,
     },
     /// Update the service tier preference for future turns.
-    SetServiceTier { service_tier: Option<ServiceTier> },
+    SetServiceTier { service_tier: Option<String> },
     /// Update the active (or default) model personality.
     SetModelPersonality { personality: Option<Personality> },
     /// Toggle the acknowledgement flag under `[notice]`.
@@ -38,16 +45,26 @@ pub enum ConfigEdit {
     SetNoticeHideWorldWritableWarning(bool),
     /// Toggle the rate limit model nudge acknowledgement flag.
     SetNoticeHideRateLimitModelNudge(bool),
-    /// Toggle the Windows onboarding acknowledgement flag.
-    SetWindowsWslSetupAcknowledged(bool),
     /// Toggle the model migration prompt acknowledgement flag.
     SetNoticeHideModelMigrationPrompt(String, bool),
+    /// Toggle the home external config migration prompt acknowledgement flag.
+    SetNoticeHideExternalConfigMigrationPromptHome(bool),
+    /// Record when the home external config migration prompt was last shown.
+    SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(i64),
+    /// Toggle the project external config migration prompt acknowledgement flag.
+    SetNoticeHideExternalConfigMigrationPromptProject(String, bool),
+    /// Record when the project external config migration prompt was last shown.
+    SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(String, i64),
     /// Record that a migration prompt was shown for an old->new model mapping.
     RecordModelMigrationSeen { from: String, to: String },
     /// Replace the entire `[mcp_servers]` table.
     ReplaceMcpServers(BTreeMap<String, McpServerConfig>),
-    /// Set or clear a skill config entry under `[[skills.config]]`.
+    /// Add a disabled tool suggestion under `[tool_suggest].disabled_tools`.
+    AddToolSuggestDisabledTool(ToolSuggestDisabledTool),
+    /// Set or clear a skill config entry under `[[skills.config]]` by path.
     SetSkillConfig { path: PathBuf, enabled: bool },
+    /// Set or clear a skill config entry under `[[skills.config]]` by name.
+    SetSkillConfigByName { name: String, enabled: bool },
     /// Set trust_level under `[projects."<path>"]`,
     /// migrating inline tables to explicit tables.
     SetProjectTrustLevel { path: PathBuf, level: TrustLevel },
@@ -60,11 +77,33 @@ pub enum ConfigEdit {
     ClearPath { segments: Vec<String> },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SkillConfigSelector {
+    Name(String),
+    Path(PathBuf),
+}
+
 /// Produces a config edit that sets `[tui].theme = "<name>"`.
 pub fn syntax_theme_edit(name: &str) -> ConfigEdit {
     ConfigEdit::SetPath {
         segments: vec!["tui".to_string(), "theme".to_string()],
         value: value(name.to_string()),
+    }
+}
+
+/// Produces a config edit that sets [tui].pet = "<name>".
+pub fn tui_pet_edit(name: &str) -> ConfigEdit {
+    ConfigEdit::SetPath {
+        segments: vec!["tui".to_string(), "pet".to_string()],
+        value: value(name.to_string()),
+    }
+}
+
+/// Produces a config edit that sets `[tui].session_picker_view = "<mode>"`.
+pub fn session_picker_view_edit(mode: SessionPickerViewMode) -> ConfigEdit {
+    ConfigEdit::SetPath {
+        segments: vec!["tui".to_string(), "session_picker_view".to_string()],
+        value: value(mode.to_string()),
     }
 }
 
@@ -81,6 +120,14 @@ pub fn status_line_items_edit(items: &[String]) -> ConfigEdit {
     }
 }
 
+/// Produces a config edit that sets `[tui].status_line_use_colors`.
+pub fn status_line_use_colors_edit(enabled: bool) -> ConfigEdit {
+    ConfigEdit::SetPath {
+        segments: vec!["tui".to_string(), "status_line_use_colors".to_string()],
+        value: value(enabled),
+    }
+}
+
 /// Produces a config edit that sets `[tui].terminal_title` to an explicit ordered list.
 ///
 /// The array is written even when it is empty so "disabled title updates" stays
@@ -94,9 +141,48 @@ pub fn terminal_title_items_edit(items: &[String]) -> ConfigEdit {
     }
 }
 
+fn keymap_binding_value(keys: &[String]) -> TomlItem {
+    if let [key] = keys {
+        value(key.to_string())
+    } else {
+        let array = keys.iter().cloned().collect::<toml_edit::Array>();
+        TomlItem::Value(array.into())
+    }
+}
+
+/// Produces a config edit that replaces one root-level TUI keymap binding list.
+pub fn keymap_bindings_edit(context: &str, action: &str, keys: &[String]) -> ConfigEdit {
+    ConfigEdit::SetPath {
+        segments: vec![
+            "tui".to_string(),
+            "keymap".to_string(),
+            context.to_string(),
+            action.to_string(),
+        ],
+        value: keymap_binding_value(keys),
+    }
+}
+
+/// Produces a config edit that replaces one root-level TUI keymap binding.
+pub fn keymap_binding_edit(context: &str, action: &str, key: &str) -> ConfigEdit {
+    keymap_bindings_edit(context, action, &[key.to_string()])
+}
+
+/// Produces a config edit that removes one root-level TUI keymap binding.
+pub fn keymap_binding_clear_edit(context: &str, action: &str) -> ConfigEdit {
+    ConfigEdit::ClearPath {
+        segments: vec![
+            "tui".to_string(),
+            "keymap".to_string(),
+            context.to_string(),
+            action.to_string(),
+        ],
+    }
+}
+
 pub fn model_availability_nux_count_edits(shown_count: &HashMap<String, u32>) -> Vec<ConfigEdit> {
     let mut shown_count_entries: Vec<_> = shown_count.iter().collect();
-    shown_count_entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    shown_count_entries.sort_unstable_by_key(|(left, _)| *left);
 
     let mut edits = vec![ConfigEdit::ClearPath {
         segments: vec!["tui".to_string(), "model_availability_nux".to_string()],
@@ -115,209 +201,8 @@ pub fn model_availability_nux_count_edits(shown_count: &HashMap<String, u32>) ->
     edits
 }
 
-// TODO(jif) move to a dedicated file
-mod document_helpers {
-    use crate::config::types::McpServerConfig;
-    use crate::config::types::McpServerTransportConfig;
-    use toml_edit::Array as TomlArray;
-    use toml_edit::InlineTable;
-    use toml_edit::Item as TomlItem;
-    use toml_edit::Table as TomlTable;
-    use toml_edit::value;
-
-    pub(super) fn ensure_table_for_write(item: &mut TomlItem) -> Option<&mut TomlTable> {
-        match item {
-            TomlItem::Table(table) => Some(table),
-            TomlItem::Value(value) => {
-                if let Some(inline) = value.as_inline_table() {
-                    *item = TomlItem::Table(table_from_inline(inline));
-                    item.as_table_mut()
-                } else {
-                    *item = TomlItem::Table(new_implicit_table());
-                    item.as_table_mut()
-                }
-            }
-            TomlItem::None => {
-                *item = TomlItem::Table(new_implicit_table());
-                item.as_table_mut()
-            }
-            _ => None,
-        }
-    }
-
-    pub(super) fn ensure_table_for_read(item: &mut TomlItem) -> Option<&mut TomlTable> {
-        match item {
-            TomlItem::Table(table) => Some(table),
-            TomlItem::Value(value) => {
-                let inline = value.as_inline_table()?;
-                *item = TomlItem::Table(table_from_inline(inline));
-                item.as_table_mut()
-            }
-            _ => None,
-        }
-    }
-
-    fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
-        let mut entry = TomlTable::new();
-        entry.set_implicit(false);
-
-        match &config.transport {
-            McpServerTransportConfig::Stdio {
-                command,
-                args,
-                env,
-                env_vars,
-                cwd,
-            } => {
-                entry["command"] = value(command.clone());
-                if !args.is_empty() {
-                    entry["args"] = array_from_iter(args.iter().cloned());
-                }
-                if let Some(env) = env
-                    && !env.is_empty()
-                {
-                    entry["env"] = table_from_pairs(env.iter());
-                }
-                if !env_vars.is_empty() {
-                    entry["env_vars"] = array_from_iter(env_vars.iter().cloned());
-                }
-                if let Some(cwd) = cwd {
-                    entry["cwd"] = value(cwd.to_string_lossy().to_string());
-                }
-            }
-            McpServerTransportConfig::StreamableHttp {
-                url,
-                bearer_token_env_var,
-                http_headers,
-                env_http_headers,
-            } => {
-                entry["url"] = value(url.clone());
-                if let Some(env_var) = bearer_token_env_var {
-                    entry["bearer_token_env_var"] = value(env_var.clone());
-                }
-                if let Some(headers) = http_headers
-                    && !headers.is_empty()
-                {
-                    entry["http_headers"] = table_from_pairs(headers.iter());
-                }
-                if let Some(headers) = env_http_headers
-                    && !headers.is_empty()
-                {
-                    entry["env_http_headers"] = table_from_pairs(headers.iter());
-                }
-            }
-        }
-
-        if !config.enabled {
-            entry["enabled"] = value(false);
-        }
-        if config.required {
-            entry["required"] = value(true);
-        }
-        if let Some(timeout) = config.startup_timeout_sec {
-            entry["startup_timeout_sec"] = value(timeout.as_secs_f64());
-        }
-        if let Some(timeout) = config.tool_timeout_sec {
-            entry["tool_timeout_sec"] = value(timeout.as_secs_f64());
-        }
-        if let Some(enabled_tools) = &config.enabled_tools
-            && !enabled_tools.is_empty()
-        {
-            entry["enabled_tools"] = array_from_iter(enabled_tools.iter().cloned());
-        }
-        if let Some(disabled_tools) = &config.disabled_tools
-            && !disabled_tools.is_empty()
-        {
-            entry["disabled_tools"] = array_from_iter(disabled_tools.iter().cloned());
-        }
-        if let Some(scopes) = &config.scopes
-            && !scopes.is_empty()
-        {
-            entry["scopes"] = array_from_iter(scopes.iter().cloned());
-        }
-        if let Some(resource) = &config.oauth_resource
-            && !resource.is_empty()
-        {
-            entry["oauth_resource"] = value(resource.clone());
-        }
-
-        entry
-    }
-
-    pub(super) fn serialize_mcp_server(config: &McpServerConfig) -> TomlItem {
-        TomlItem::Table(serialize_mcp_server_table(config))
-    }
-
-    pub(super) fn serialize_mcp_server_inline(config: &McpServerConfig) -> InlineTable {
-        serialize_mcp_server_table(config).into_inline_table()
-    }
-
-    pub(super) fn merge_inline_table(existing: &mut InlineTable, replacement: InlineTable) {
-        existing.retain(|key, _| replacement.get(key).is_some());
-
-        for (key, value) in replacement.iter() {
-            if let Some(existing_value) = existing.get_mut(key) {
-                let mut updated_value = value.clone();
-                *updated_value.decor_mut() = existing_value.decor().clone();
-                *existing_value = updated_value;
-            } else {
-                existing.insert(key.to_string(), value.clone());
-            }
-        }
-    }
-
-    fn table_from_inline(inline: &InlineTable) -> TomlTable {
-        let mut table = new_implicit_table();
-        for (key, value) in inline.iter() {
-            let mut value = value.clone();
-            let decor = value.decor_mut();
-            decor.set_suffix("");
-            table.insert(key, TomlItem::Value(value));
-        }
-        table
-    }
-
-    pub(super) fn new_implicit_table() -> TomlTable {
-        let mut table = TomlTable::new();
-        table.set_implicit(true);
-        table
-    }
-
-    fn array_from_iter<I>(iter: I) -> TomlItem
-    where
-        I: Iterator<Item = String>,
-    {
-        let mut array = TomlArray::new();
-        for value in iter {
-            array.push(value);
-        }
-        TomlItem::Value(array.into())
-    }
-
-    fn table_from_pairs<'a, I>(pairs: I) -> TomlItem
-    where
-        I: IntoIterator<Item = (&'a String, &'a String)>,
-    {
-        let mut entries: Vec<_> = pairs.into_iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let mut table = TomlTable::new();
-        table.set_implicit(false);
-        for (key, val) in entries {
-            table.insert(key, value(val.clone()));
-        }
-        TomlItem::Table(table)
-    }
-}
-
 struct ConfigDocument {
     doc: DocumentMut,
-    profile: Option<String>,
-}
-
-#[derive(Copy, Clone)]
-enum Scope {
-    Global,
-    Profile,
 }
 
 #[derive(Copy, Clone)]
@@ -327,69 +212,130 @@ enum TraversalMode {
 }
 
 impl ConfigDocument {
-    fn new(doc: DocumentMut, profile: Option<String>) -> Self {
-        Self { doc, profile }
+    fn new(doc: DocumentMut) -> Self {
+        Self { doc }
     }
 
     fn apply(&mut self, edit: &ConfigEdit) -> anyhow::Result<bool> {
         match edit {
             ConfigEdit::SetModel { model, effort } => Ok({
                 let mut mutated = false;
-                mutated |= self.write_profile_value(
+                mutated |= self.write_optional_value(
                     &["model"],
                     model.as_ref().map(|model_value| value(model_value.clone())),
                 );
-                mutated |= self.write_profile_value(
+                mutated |= self.write_optional_value(
                     &["model_reasoning_effort"],
-                    effort.map(|effort| value(effort.to_string())),
+                    effort.as_ref().map(|effort| value(effort.to_string())),
                 );
                 mutated
             }),
-            ConfigEdit::SetServiceTier { service_tier } => Ok(self.write_profile_value(
+            ConfigEdit::SetServiceTier { service_tier } => Ok(self.write_optional_value(
                 &["service_tier"],
-                service_tier.map(|service_tier| value(service_tier.to_string())),
+                service_tier.as_ref().map(|service_tier| {
+                    // Keep the legacy config spelling stable. Runtime values use
+                    // `priority`, but config.toml continues to store it as `fast`.
+                    let config_value = match ServiceTier::from_request_value(service_tier) {
+                        Some(ServiceTier::Fast) => "fast",
+                        Some(ServiceTier::Flex) => "flex",
+                        None => service_tier.as_str(),
+                    };
+                    value(config_value)
+                }),
             )),
-            ConfigEdit::SetModelPersonality { personality } => Ok(self.write_profile_value(
+            ConfigEdit::SetModelPersonality { personality } => Ok(self.write_optional_value(
                 &["personality"],
                 personality.map(|personality| value(personality.to_string())),
             )),
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
-                Scope::Global,
-                &[Notice::TABLE_KEY, "hide_full_access_warning"],
+                &[NOTICE_TABLE_KEY, "hide_full_access_warning"],
                 value(*acknowledged),
             )),
             ConfigEdit::SetNoticeHideWorldWritableWarning(acknowledged) => Ok(self.write_value(
-                Scope::Global,
-                &[Notice::TABLE_KEY, "hide_world_writable_warning"],
+                &[NOTICE_TABLE_KEY, "hide_world_writable_warning"],
                 value(*acknowledged),
             )),
             ConfigEdit::SetNoticeHideRateLimitModelNudge(acknowledged) => Ok(self.write_value(
-                Scope::Global,
-                &[Notice::TABLE_KEY, "hide_rate_limit_model_nudge"],
+                &[NOTICE_TABLE_KEY, "hide_rate_limit_model_nudge"],
                 value(*acknowledged),
             )),
             ConfigEdit::SetNoticeHideModelMigrationPrompt(migration_config, acknowledged) => {
                 Ok(self.write_value(
-                    Scope::Global,
-                    &[Notice::TABLE_KEY, migration_config.as_str()],
+                    &[NOTICE_TABLE_KEY, migration_config.as_str()],
                     value(*acknowledged),
                 ))
             }
-            ConfigEdit::RecordModelMigrationSeen { from, to } => Ok(self.write_value(
-                Scope::Global,
-                &[Notice::TABLE_KEY, "model_migrations", from.as_str()],
-                value(to.clone()),
-            )),
-            ConfigEdit::SetWindowsWslSetupAcknowledged(acknowledged) => Ok(self.write_value(
-                Scope::Global,
-                &["windows_wsl_setup_acknowledged"],
+            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(acknowledged) => Ok(self
+                .write_value(
+                    &[
+                        NOTICE_TABLE_KEY,
+                        "external_config_migration_prompts",
+                        "home",
+                    ],
+                    value(*acknowledged),
+                )),
+            ConfigEdit::SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(timestamp) => {
+                Ok(self.write_value(
+                    &[
+                        NOTICE_TABLE_KEY,
+                        "external_config_migration_prompts",
+                        "home_last_prompted_at",
+                    ],
+                    value(*timestamp),
+                ))
+            }
+            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
+                project,
+                acknowledged,
+            ) => Ok(self.write_value(
+                &[
+                    NOTICE_TABLE_KEY,
+                    "external_config_migration_prompts",
+                    "projects",
+                    project.as_str(),
+                ],
                 value(*acknowledged),
             )),
+            ConfigEdit::SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(
+                project,
+                timestamp,
+            ) => Ok(self.write_value(
+                &[
+                    NOTICE_TABLE_KEY,
+                    "external_config_migration_prompts",
+                    "project_last_prompted_at",
+                    project.as_str(),
+                ],
+                value(*timestamp),
+            )),
+            ConfigEdit::RecordModelMigrationSeen { from, to } => Ok(self.write_value(
+                &[NOTICE_TABLE_KEY, "model_migrations", from.as_str()],
+                value(to.clone()),
+            )),
             ConfigEdit::ReplaceMcpServers(servers) => Ok(self.replace_mcp_servers(servers)),
-            ConfigEdit::SetSkillConfig { path, enabled } => {
-                Ok(self.set_skill_config(path.as_path(), *enabled))
+            ConfigEdit::AddToolSuggestDisabledTool(disabled_tool) => {
+                Ok(self.add_tool_suggest_disabled_tool(disabled_tool))
             }
-            ConfigEdit::SetPath { segments, value } => Ok(self.insert(segments, value.clone())),
+            ConfigEdit::SetSkillConfig { path, enabled } => {
+                Ok(self.set_skill_config(SkillConfigSelector::Path(path.clone()), *enabled))
+            }
+            ConfigEdit::SetSkillConfigByName { name, enabled } => {
+                Ok(self.set_skill_config(SkillConfigSelector::Name(name.clone()), *enabled))
+            }
+            ConfigEdit::SetPath { segments, value } => {
+                if is_multi_agent_v2_feature_path(segments) && value.as_bool().is_some() {
+                    let mut existing = Some(self.doc.as_item());
+                    for segment in segments {
+                        existing = existing.and_then(|item| item.as_table_like()?.get(segment));
+                    }
+                    if existing.and_then(TomlItem::as_table_like).is_some() {
+                        let mut enabled_segments = segments.clone();
+                        enabled_segments.push("enabled".to_string());
+                        return Ok(self.insert(&enabled_segments, value.clone()));
+                    }
+                }
+                Ok(self.insert(segments, value.clone()))
+            }
             ConfigEdit::ClearPath { segments } => Ok(self.clear_owned(segments)),
             ConfigEdit::SetProjectTrustLevel { path, level } => {
                 // Delegate to the existing, tested logic in config.rs to
@@ -404,21 +350,61 @@ impl ConfigDocument {
         }
     }
 
-    fn write_profile_value(&mut self, segments: &[&str], value: Option<TomlItem>) -> bool {
+    fn write_optional_value(&mut self, segments: &[&str], value: Option<TomlItem>) -> bool {
         match value {
-            Some(item) => self.write_value(Scope::Profile, segments, item),
-            None => self.clear(Scope::Profile, segments),
+            Some(item) => self.write_value(segments, item),
+            None => self.clear(segments),
         }
     }
 
-    fn write_value(&mut self, scope: Scope, segments: &[&str], value: TomlItem) -> bool {
-        let resolved = self.scoped_segments(scope, segments);
+    fn write_value(&mut self, segments: &[&str], value: TomlItem) -> bool {
+        let resolved = segments
+            .iter()
+            .map(|segment| (*segment).to_string())
+            .collect::<Vec<_>>();
         self.insert(&resolved, value)
     }
 
-    fn clear(&mut self, scope: Scope, segments: &[&str]) -> bool {
-        let resolved = self.scoped_segments(scope, segments);
+    fn clear(&mut self, segments: &[&str]) -> bool {
+        let resolved = segments
+            .iter()
+            .map(|segment| (*segment).to_string())
+            .collect::<Vec<_>>();
         self.remove(&resolved)
+    }
+
+    fn add_tool_suggest_disabled_tool(&mut self, disabled_tool: &ToolSuggestDisabledTool) -> bool {
+        let disabled_tools_item = self
+            .doc
+            .get("tool_suggest")
+            .and_then(|item| item.as_table_like())
+            .and_then(|table| table.get("disabled_tools"));
+        let existing_from_array = disabled_tools_item
+            .and_then(|item| item.as_value())
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flat_map(|array| array.iter())
+            .filter_map(document_helpers::parse_tool_suggest_disabled_tool);
+        let existing_from_tables = disabled_tools_item
+            .and_then(|item| match item {
+                TomlItem::ArrayOfTables(array) => Some(array),
+                _ => None,
+            })
+            .into_iter()
+            .flat_map(|array| array.iter())
+            .filter_map(document_helpers::parse_tool_suggest_disabled_tool_table);
+
+        let mut seen = HashSet::new();
+        let disabled_tools = existing_from_array
+            .chain(existing_from_tables)
+            .chain(std::iter::once(disabled_tool.clone()))
+            .filter_map(|disabled_tool| disabled_tool.normalized())
+            .filter(|disabled_tool| seen.insert(disabled_tool.clone()))
+            .collect::<Vec<_>>();
+        self.write_value(
+            &["tool_suggest", "disabled_tools"],
+            document_helpers::tool_suggest_disabled_tools_value(&disabled_tools),
+        )
     }
 
     fn clear_owned(&mut self, segments: &[String]) -> bool {
@@ -427,7 +413,7 @@ impl ConfigDocument {
 
     fn replace_mcp_servers(&mut self, servers: &BTreeMap<String, McpServerConfig>) -> bool {
         if servers.is_empty() {
-            return self.clear(Scope::Global, &["mcp_servers"]);
+            return self.clear(&["mcp_servers"]);
         }
 
         let root = self.doc.as_table_mut();
@@ -478,8 +464,16 @@ impl ConfigDocument {
         true
     }
 
-    fn set_skill_config(&mut self, path: &Path, enabled: bool) -> bool {
-        let normalized_path = normalize_skill_config_path(path);
+    fn set_skill_config(&mut self, selector: SkillConfigSelector, enabled: bool) -> bool {
+        let selector = match selector {
+            SkillConfigSelector::Name(name) => SkillConfigSelector::Name(name.trim().to_string()),
+            SkillConfigSelector::Path(path) => {
+                SkillConfigSelector::Path(PathBuf::from(normalize_skill_config_path(&path)))
+            }
+        };
+        if matches!(&selector, SkillConfigSelector::Name(name) if name.is_empty()) {
+            return false;
+        }
         let mut remove_skills_table = false;
         let mut mutated = false;
 
@@ -538,12 +532,8 @@ impl ConfigDocument {
             };
 
             let existing_index = overrides.iter().enumerate().find_map(|(idx, table)| {
-                table
-                    .get("path")
-                    .and_then(|item| item.as_str())
-                    .map(Path::new)
-                    .map(normalize_skill_config_path)
-                    .filter(|value| *value == normalized_path)
+                skill_config_selector_from_table(table)
+                    .filter(|value| value == &selector)
                     .map(|_| idx)
             });
 
@@ -561,7 +551,7 @@ impl ConfigDocument {
             } else if let Some(index) = existing_index {
                 for (idx, table) in overrides.iter_mut().enumerate() {
                     if idx == index {
-                        table["path"] = value(normalized_path);
+                        write_skill_config_selector(table, &selector);
                         table["enabled"] = value(false);
                         mutated = true;
                         break;
@@ -570,7 +560,7 @@ impl ConfigDocument {
             } else {
                 let mut entry = TomlTable::new();
                 entry.set_implicit(false);
-                entry["path"] = value(normalized_path);
+                write_skill_config_selector(&mut entry, &selector);
                 entry["enabled"] = value(false);
                 overrides.push(entry);
                 mutated = true;
@@ -583,26 +573,6 @@ impl ConfigDocument {
         }
 
         mutated
-    }
-
-    fn scoped_segments(&self, scope: Scope, segments: &[&str]) -> Vec<String> {
-        let resolved: Vec<String> = segments
-            .iter()
-            .map(|segment| (*segment).to_string())
-            .collect();
-
-        if matches!(scope, Scope::Profile)
-            && resolved.first().is_none_or(|segment| segment != "profiles")
-            && let Some(profile) = self.profile.as_deref()
-        {
-            let mut scoped = Vec::with_capacity(resolved.len() + 2);
-            scoped.push("profiles".to_string());
-            scoped.push(profile.to_string());
-            scoped.extend(resolved);
-            return scoped;
-        }
-
-        resolved
     }
 
     fn insert(&mut self, segments: &[String], value: TomlItem) -> bool {
@@ -637,7 +607,7 @@ impl ConfigDocument {
     fn descend(&mut self, segments: &[String], mode: TraversalMode) -> Option<&mut TomlTable> {
         let mut current = self.doc.as_table_mut();
 
-        for segment in segments {
+        for (index, segment) in segments.iter().enumerate() {
             match mode {
                 TraversalMode::Create => {
                     if !current.contains_key(segment.as_str()) {
@@ -648,6 +618,13 @@ impl ConfigDocument {
                     }
 
                     let item = current.get_mut(segment.as_str())?;
+                    if is_multi_agent_v2_feature_path(&segments[..=index])
+                        && let Some(enabled) = item.as_bool()
+                    {
+                        let mut feature = document_helpers::new_implicit_table();
+                        feature.insert("enabled", value(enabled));
+                        *item = TomlItem::Table(feature);
+                    }
                     current = document_helpers::ensure_table_for_write(item)?;
                 }
                 TraversalMode::Existing => {
@@ -692,6 +669,16 @@ impl ConfigDocument {
     }
 }
 
+fn is_multi_agent_v2_feature_path(segments: &[String]) -> bool {
+    match segments {
+        [features, feature] => features == "features" && feature == "multi_agent_v2",
+        [profiles, _, features, feature] => {
+            profiles == "profiles" && features == "features" && feature == "multi_agent_v2"
+        }
+        _ => false,
+    }
+}
+
 fn normalize_skill_config_path(path: &Path) -> String {
     dunce::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -699,18 +686,53 @@ fn normalize_skill_config_path(path: &Path) -> String {
         .to_string()
 }
 
+fn skill_config_selector_from_table(table: &TomlTable) -> Option<SkillConfigSelector> {
+    let path = table
+        .get("path")
+        .and_then(|item| item.as_str())
+        .map(Path::new)
+        .map(|path| SkillConfigSelector::Path(PathBuf::from(normalize_skill_config_path(path))));
+    let name = table
+        .get("name")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| SkillConfigSelector::Name(name.to_string()));
+
+    match (path, name) {
+        (Some(selector), None) | (None, Some(selector)) => Some(selector),
+        _ => None,
+    }
+}
+
+fn write_skill_config_selector(table: &mut TomlTable, selector: &SkillConfigSelector) {
+    match selector {
+        SkillConfigSelector::Name(name) => {
+            table.remove("path");
+            table["name"] = value(name.clone());
+        }
+        SkillConfigSelector::Path(path) => {
+            table.remove("name");
+            table["path"] = value(path.to_string_lossy().to_string());
+        }
+    }
+}
+
 /// Persist edits using a blocking strategy.
-pub fn apply_blocking(
-    codex_home: &Path,
-    profile: Option<&str>,
+pub fn apply_blocking(codex_home: &Path, edits: &[ConfigEdit]) -> anyhow::Result<()> {
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    apply_blocking_to_resolved_file(&config_path, edits)
+}
+
+fn apply_blocking_to_resolved_file(
+    resolved_config_file: &Path,
     edits: &[ConfigEdit],
 ) -> anyhow::Result<()> {
     if edits.is_empty() {
         return Ok(());
     }
 
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let write_paths = resolve_symlink_write_paths(&config_path)?;
+    let write_paths = resolve_symlink_write_paths(resolved_config_file)?;
     let serialized = match write_paths.read_path {
         Some(path) => match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
@@ -726,13 +748,7 @@ pub fn apply_blocking(
         serialized.parse::<DocumentMut>()?
     };
 
-    let profile = profile.map(ToOwned::to_owned).or_else(|| {
-        doc.get("profile")
-            .and_then(|item| item.as_str())
-            .map(ToOwned::to_owned)
-    });
-
-    let mut document = ConfigDocument::new(doc, profile);
+    let mut document = ConfigDocument::new(doc);
     let mut mutated = false;
 
     for edit in edits {
@@ -745,7 +761,7 @@ pub fn apply_blocking(
 
     write_atomically(&write_paths.write_path, &document.doc.to_string()).with_context(|| {
         format!(
-            "failed to persist config.toml at {}",
+            "failed to persist config at {}",
             write_paths.write_path.display()
         )
     })?;
@@ -753,39 +769,32 @@ pub fn apply_blocking(
     Ok(())
 }
 
-/// Persist edits asynchronously by offloading the blocking writer.
-pub async fn apply(
-    codex_home: &Path,
-    profile: Option<&str>,
-    edits: Vec<ConfigEdit>,
-) -> anyhow::Result<()> {
-    let codex_home = codex_home.to_path_buf();
-    let profile = profile.map(ToOwned::to_owned);
-    task::spawn_blocking(move || apply_blocking(&codex_home, profile.as_deref(), &edits))
-        .await
-        .context("config persistence task panicked")?
-}
-
 /// Fluent builder to batch config edits and apply them atomically.
 #[derive(Default)]
 pub struct ConfigEditsBuilder {
-    codex_home: PathBuf,
-    profile: Option<String>,
+    config_path: PathBuf,
     edits: Vec<ConfigEdit>,
 }
 
 impl ConfigEditsBuilder {
     pub fn new(codex_home: &Path) -> Self {
-        Self {
-            codex_home: codex_home.to_path_buf(),
-            profile: None,
-            edits: Vec::new(),
-        }
+        Self::for_config_path(&codex_home.join(CONFIG_TOML_FILE))
     }
 
-    pub fn with_profile(mut self, profile: Option<&str>) -> Self {
-        self.profile = profile.map(ToOwned::to_owned);
-        self
+    pub fn for_config(config: &crate::config::Config) -> Self {
+        let config_path = config
+            .config_layer_stack
+            .get_user_config_file()
+            .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf)
+            .unwrap_or_else(|| config.codex_home.join(CONFIG_TOML_FILE).to_path_buf());
+        Self::for_config_path(&config_path)
+    }
+
+    pub fn for_config_path(config_path: &Path) -> Self {
+        Self {
+            config_path: config_path.to_path_buf(),
+            edits: Vec::new(),
+        }
     }
 
     pub fn set_model(mut self, model: Option<&str>, effort: Option<ReasoningEffort>) -> Self {
@@ -796,14 +805,8 @@ impl ConfigEditsBuilder {
         self
     }
 
-    pub fn set_service_tier(mut self, service_tier: Option<ServiceTier>) -> Self {
+    pub fn set_service_tier(mut self, service_tier: Option<String>) -> Self {
         self.edits.push(ConfigEdit::SetServiceTier { service_tier });
-        self
-    }
-
-    pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
-        self.edits
-            .push(ConfigEdit::SetModelPersonality { personality });
         self
     }
 
@@ -825,26 +828,11 @@ impl ConfigEditsBuilder {
         self
     }
 
-    pub fn set_hide_model_migration_prompt(mut self, model: &str, acknowledged: bool) -> Self {
-        self.edits
-            .push(ConfigEdit::SetNoticeHideModelMigrationPrompt(
-                model.to_string(),
-                acknowledged,
-            ));
-        self
-    }
-
     pub fn record_model_migration_seen(mut self, from: &str, to: &str) -> Self {
         self.edits.push(ConfigEdit::RecordModelMigrationSeen {
             from: from.to_string(),
             to: to.to_string(),
         });
-        self
-    }
-
-    pub fn set_windows_wsl_setup_acknowledged(mut self, acknowledged: bool) -> Self {
-        self.edits
-            .push(ConfigEdit::SetWindowsWslSetupAcknowledged(acknowledged));
         self
     }
 
@@ -874,27 +862,25 @@ impl ConfigEditsBuilder {
 
     /// Enable or disable a feature flag by key under the `[features]` table.
     ///
-    /// Disabling a default-false feature clears the root-scoped key instead of
+    /// Disabling a default-false feature clears the key instead of
     /// persisting `false`, so the config does not pin the feature once it
-    /// graduates to globally enabled. Profile-scoped disables still persist
-    /// `false` so they can override an inherited root enable.
+    /// graduates to globally enabled. Structured multi-agent v2 settings are
+    /// an exception: its explicit `enabled = false` preserves nested options.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
-        let profile_scoped = self.profile.is_some();
-        let segments = if let Some(profile) = self.profile.as_ref() {
-            vec![
-                "profiles".to_string(),
-                profile.clone(),
-                "features".to_string(),
-                key.to_string(),
-            ]
-        } else {
-            vec!["features".to_string(), key.to_string()]
-        };
+        let mut segments = vec!["features".to_string(), key.to_string()];
+        if key == "multi_agent_v2" && !enabled {
+            segments.push("enabled".to_string());
+            self.edits.push(ConfigEdit::SetPath {
+                segments,
+                value: value(false),
+            });
+            return self;
+        }
         let is_default_false_feature = FEATURES
             .iter()
             .find(|spec| spec.key == key)
             .is_some_and(|spec| !spec.default_enabled);
-        if enabled || profile_scoped || !is_default_false_feature {
+        if enabled || !is_default_false_feature {
             self.edits.push(ConfigEdit::SetPath {
                 segments,
                 value: value(enabled),
@@ -906,18 +892,8 @@ impl ConfigEditsBuilder {
     }
 
     pub fn set_windows_sandbox_mode(mut self, mode: &str) -> Self {
-        let segments = if let Some(profile) = self.profile.as_ref() {
-            vec![
-                "profiles".to_string(),
-                profile.clone(),
-                "windows".to_string(),
-                "sandbox".to_string(),
-            ]
-        } else {
-            vec!["windows".to_string(), "sandbox".to_string()]
-        };
         self.edits.push(ConfigEdit::SetPath {
-            segments,
+            segments: vec!["windows".to_string(), "sandbox".to_string()],
             value: value(mode),
         });
         self
@@ -947,23 +923,43 @@ impl ConfigEditsBuilder {
         self
     }
 
+    pub fn set_realtime_voice(mut self, voice: Option<&str>) -> Self {
+        let segments = vec!["realtime".to_string(), "voice".to_string()];
+        match voice {
+            Some(voice) => self.edits.push(ConfigEdit::SetPath {
+                segments,
+                value: value(voice),
+            }),
+            None => self.edits.push(ConfigEdit::ClearPath { segments }),
+        }
+        self
+    }
+
     pub fn clear_legacy_windows_sandbox_keys(mut self) -> Self {
         for key in [
             "experimental_windows_sandbox",
             "elevated_windows_sandbox",
             "enable_experimental_windows_sandbox",
         ] {
-            let mut segments = vec!["features".to_string(), key.to_string()];
-            if let Some(profile) = self.profile.as_ref() {
-                segments = vec![
-                    "profiles".to_string(),
-                    profile.clone(),
-                    "features".to_string(),
-                    key.to_string(),
-                ];
-            }
+            let segments = vec!["features".to_string(), key.to_string()];
             self.edits.push(ConfigEdit::ClearPath { segments });
         }
+        self
+    }
+
+    pub fn set_session_picker_view(mut self, mode: SessionPickerViewMode) -> Self {
+        self.edits.push(ConfigEdit::SetPath {
+            segments: vec!["tui".to_string(), "session_picker_view".to_string()],
+            value: value(mode.to_string()),
+        });
+        self
+    }
+
+    pub fn set_resume_cwd(mut self, mode: ResumeCwdMode) -> Self {
+        self.edits.push(ConfigEdit::SetPath {
+            segments: vec!["tui".to_string(), "resume_cwd".to_string()],
+            value: value(mode.as_str()),
+        });
         self
     }
 
@@ -977,13 +973,13 @@ impl ConfigEditsBuilder {
 
     /// Apply edits on a blocking thread.
     pub fn apply_blocking(self) -> anyhow::Result<()> {
-        apply_blocking(&self.codex_home, self.profile.as_deref(), &self.edits)
+        apply_blocking_to_resolved_file(&self.config_path, &self.edits)
     }
 
     /// Apply edits asynchronously via a blocking offload.
     pub async fn apply(self) -> anyhow::Result<()> {
         task::spawn_blocking(move || {
-            apply_blocking(&self.codex_home, self.profile.as_deref(), &self.edits)
+            apply_blocking_to_resolved_file(&self.config_path, &self.edits)
         })
         .await
         .context("config persistence task panicked")?

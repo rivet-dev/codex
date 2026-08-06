@@ -37,9 +37,11 @@ describe("Codex", () => {
       ];
       expect(result.items).toEqual(expectedItems);
       expect(result.usage).toEqual({
+        cache_write_input_tokens: 0,
         cached_input_tokens: 12,
         input_tokens: 42,
         output_tokens: 5,
+        reasoning_output_tokens: 0,
       });
       expect(thread.id).toEqual(expect.any(String));
     } finally {

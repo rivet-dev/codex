@@ -2,12 +2,13 @@
 //!
 //! Wraps [syntect] with the [two_face] grammar and theme bundles to provide
 //! ~250-language syntax highlighting and 32 bundled color themes.  The module
-//! owns four process-global singletons:
+//! owns five process-global singletons:
 //!
 //! | Singleton | Type | Purpose |
 //! |---|---|---|
 //! | `SYNTAX_SET` | `OnceLock<SyntaxSet>` | Grammar database, immutable after init |
 //! | `THEME` | `OnceLock<RwLock<Theme>>` | Active color theme, swappable at runtime |
+//! | `THEME_REVISION` | `AtomicU64` | Invalidates rendered-content caches after theme swaps |
 //! | `THEME_OVERRIDE` | `OnceLock<Option<String>>` | Persisted user preference (write-once) |
 //! | `CODEX_HOME` | `OnceLock<Option<PathBuf>>` | Root for custom `.tmTheme` discovery |
 //!
@@ -17,9 +18,10 @@
 //! swap/snapshot the theme for live preview.  All highlighting functions read
 //! the theme via `theme_lock()`.
 //!
-//! **Guardrails:** inputs exceeding 512 KB or 10 000 lines are rejected early
-//! (returns `None`) to prevent pathological CPU/memory usage.  Callers must
-//! fall back to plain unstyled text.
+//! **Guardrails:** inputs exceeding 512 KB or 10 000 lines, or containing an
+//! individual line longer than 4 KiB, are rejected early (returns `None`) to
+//! prevent pathological CPU/memory usage.  Callers must fall back to plain
+//! unstyled text.
 
 use ratatui::style::Color as RtColor;
 use ratatui::style::Modifier;
@@ -30,6 +32,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Color as SyntectColor;
 use syntect::highlighting::FontStyle;
@@ -47,6 +51,7 @@ use two_face::theme::EmbeddedThemeName;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
+static THEME_REVISION: AtomicU64 = AtomicU64::new(0);
 static THEME_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 static CODEX_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 
@@ -237,13 +242,19 @@ fn theme_lock() -> &'static RwLock<Theme> {
     THEME.get_or_init(|| RwLock::new(build_default_theme()))
 }
 
-/// Swap the active syntax theme at runtime (for live preview).
+/// Swap the active syntax theme at runtime and invalidate rendered-content caches.
 pub(crate) fn set_syntax_theme(theme: Theme) {
     let mut guard = match theme_lock().write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = theme;
+    THEME_REVISION.fetch_add(1, Ordering::Release);
+}
+
+/// Return the revision of the active syntax theme for rendered-content caches.
+pub(crate) fn syntax_theme_revision() -> u64 {
+    THEME_REVISION.load(Ordering::Acquire)
 }
 
 /// Clone the current syntax theme (e.g. to save for cancel-restore).
@@ -296,6 +307,22 @@ fn scope_background_rgb(highlighter: &Highlighter<'_>, scope_name: &str) -> Opti
     let scope = Scope::new(scope_name).ok()?;
     let bg = highlighter.style_mod_for_stack(&[scope]).background?;
     Some((bg.r, bg.g, bg.b))
+}
+
+/// Query the active syntax theme for the first foreground style provided by the
+/// supplied TextMate scopes.
+pub(crate) fn foreground_style_for_scopes(scope_names: &[&str]) -> Option<Style> {
+    let theme = current_syntax_theme();
+    foreground_style_for_scopes_with_theme(&theme, scope_names)
+}
+
+fn foreground_style_for_scopes_with_theme(theme: &Theme, scope_names: &[&str]) -> Option<Style> {
+    let highlighter = Highlighter::new(theme);
+    scope_names.iter().find_map(|scope_name| {
+        let scope = Scope::new(scope_name).ok()?;
+        let fg = highlighter.style_mod_for_stack(&[scope]).foreground?;
+        convert_syntect_color(fg).map(|fg| Style::default().fg(fg))
+    })
 }
 
 /// Return the configured kebab-case theme name when it resolves; otherwise
@@ -510,8 +537,12 @@ fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
     let ss = syntax_set();
 
     // Aliases that two-face does not resolve on its own.
-    let patched = match lang {
+    let normalized = lang.to_ascii_lowercase();
+    let patched = match normalized.as_str() {
         "csharp" | "c-sharp" => "c#",
+        // CUDA source (.cu) and header (.cuh) files use C++ highlighting as a fallback.
+        "cu" | "cuh" => "cpp",
+        "cppm" | "cxxm" | "ixx" => "cpp",
         "golang" => "go",
         "python3" => "python",
         "shell" => "bash",
@@ -551,6 +582,9 @@ const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 /// Skip highlighting for inputs with more than 10,000 lines.
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 
+/// Skip highlighting when an individual line is longer than 4 KiB.
+pub(crate) const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
+
 /// Check whether an input exceeds the safe highlighting limits.
 ///
 /// Callers that highlight content in a loop (e.g. per diff-line) should
@@ -581,7 +615,12 @@ fn highlight_to_line_spans_with_theme(
     // Bail out early for oversized inputs to avoid excessive resource usage.
     // Count actual lines (not newline bytes) to avoid an off-by-one when
     // the input does not end with a newline.
-    if code.len() > MAX_HIGHLIGHT_BYTES || code.lines().count() > MAX_HIGHLIGHT_LINES {
+    if code.len() > MAX_HIGHLIGHT_BYTES
+        || code.lines().count() > MAX_HIGHLIGHT_LINES
+        || code
+            .lines()
+            .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+    {
         return None;
     }
 
@@ -750,7 +789,7 @@ mod tests {
     }
 
     fn unique_foreground_colors_for_theme(theme_name: &str) -> Vec<String> {
-        let theme = resolve_theme_by_name(theme_name, None)
+        let theme = resolve_theme_by_name(theme_name, /*codex_home*/ None)
             .unwrap_or_else(|| panic!("expected built-in theme {theme_name} to resolve"));
         let lines = highlight_to_line_spans_with_theme(
             "fn main() { let answer = 42; println!(\"hello\"); }\n",
@@ -776,6 +815,28 @@ mod tests {
                 ..StyleModifier::default()
             },
         }
+    }
+
+    fn theme_item_with_foreground(scope: &str, foreground: (u8, u8, u8)) -> ThemeItem {
+        ThemeItem {
+            scope: ScopeSelectors::from_str(scope).expect("scope selector should parse"),
+            style: StyleModifier {
+                foreground: Some(SyntectColor {
+                    r: foreground.0,
+                    g: foreground.1,
+                    b: foreground.2,
+                    a: 255,
+                }),
+                ..StyleModifier::default()
+            },
+        }
+    }
+
+    fn assert_rgb(color: Option<RtColor>, expected: (u8, u8, u8)) {
+        let Some(RtColor::Rgb(r, g, b)) = color else {
+            panic!("expected RGB color {expected:?}, got {color:?}");
+        };
+        assert_eq!((r, g, b), expected);
     }
 
     #[test]
@@ -1000,13 +1061,13 @@ mod tests {
 
     #[test]
     fn ansi_palette_color_maps_ansi_white_to_gray() {
-        assert_eq!(ansi_palette_color(0x07), RtColor::Gray);
+        assert_eq!(ansi_palette_color(/*index*/ 0x07), RtColor::Gray);
     }
 
     #[test]
     fn ansi_family_themes_use_terminal_palette_colors_not_rgb() {
         for theme_name in ["ansi", "base16", "base16-256"] {
-            let theme = resolve_theme_by_name(theme_name, None)
+            let theme = resolve_theme_by_name(theme_name, /*codex_home*/ None)
                 .unwrap_or_else(|| panic!("expected built-in theme {theme_name} to resolve"));
             let lines = highlight_to_line_spans_with_theme(
                 "fn main() { let answer = 42; println!(\"hello\"); }\n",
@@ -1088,6 +1149,18 @@ mod tests {
     }
 
     #[test]
+    fn long_single_line_bash_skips_highlighting_and_preserves_text() {
+        let token = "eHh4".repeat(MAX_HIGHLIGHT_LINE_BYTES / 4 + 1);
+        let code = format!("printf %s {token} | base64 -d >/dev/null");
+
+        assert!(highlight_code_to_styled_spans(&code, "bash").is_none());
+        assert_eq!(
+            highlight_code_to_lines(&code, "bash"),
+            vec![Line::from(code)]
+        );
+    }
+
+    #[test]
     fn highlight_many_lines_falls_back() {
         // Input exceeding MAX_HIGHLIGHT_LINES should return None.
         let many_lines = "let x = 1;\n".repeat(MAX_HIGHLIGHT_LINES + 1);
@@ -1165,7 +1238,10 @@ mod tests {
             );
         }
         // Patched aliases that two-face cannot resolve on its own.
-        for alias in ["csharp", "c-sharp", "golang", "python3", "shell"] {
+        for alias in [
+            "csharp", "c-sharp", "cu", "cuh", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX",
+            "golang", "python3", "shell",
+        ] {
             assert!(
                 find_syntax(alias).is_some(),
                 "find_syntax({alias:?}) returned None — patched alias broken"
@@ -1211,9 +1287,37 @@ mod tests {
     }
 
     #[test]
+    fn foreground_style_for_scopes_reads_matching_theme_scope() {
+        let theme = Theme {
+            settings: ThemeSettings::default(),
+            scopes: vec![theme_item_with_foreground("keyword", (10, 20, 30))],
+            ..Theme::default()
+        };
+
+        let style = foreground_style_for_scopes_with_theme(&theme, &["keyword"])
+            .expect("expected keyword foreground style");
+
+        assert_rgb(style.fg, (10, 20, 30));
+    }
+
+    #[test]
+    fn foreground_style_for_scopes_uses_first_scope_with_foreground() {
+        let theme = Theme {
+            settings: ThemeSettings::default(),
+            scopes: vec![theme_item_with_foreground("string", (40, 50, 60))],
+            ..Theme::default()
+        };
+
+        let style = foreground_style_for_scopes_with_theme(&theme, &["keyword", "string"])
+            .expect("expected string foreground style");
+
+        assert_rgb(style.fg, (40, 50, 60));
+    }
+
+    #[test]
     fn bundled_theme_can_provide_diff_scope_backgrounds() {
-        let theme =
-            resolve_theme_by_name("github", None).expect("expected built-in GitHub theme to load");
+        let theme = resolve_theme_by_name("github", /*codex_home*/ None)
+            .expect("expected built-in GitHub theme to load");
         let rgbs = diff_scope_background_rgbs_for_theme(&theme);
         assert!(
             rgbs.inserted.is_some() && rgbs.deleted.is_some(),
@@ -1331,13 +1435,13 @@ mod tests {
     #[test]
     fn validate_theme_name_none_for_bundled() {
         // Bundled themes should never produce a warning.
-        assert!(validate_theme_name(Some("dracula"), None).is_none());
+        assert!(validate_theme_name(Some("dracula"), /*codex_home*/ None).is_none());
         assert!(validate_theme_name(Some("nord"), Some(Path::new("/nonexistent"))).is_none());
     }
 
     #[test]
     fn validate_theme_name_none_when_no_override() {
-        assert!(validate_theme_name(None, None).is_none());
+        assert!(validate_theme_name(/*name*/ None, /*codex_home*/ None).is_none());
     }
 
     #[test]

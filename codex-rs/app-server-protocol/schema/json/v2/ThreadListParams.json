@@ -1,10 +1,32 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "SortDirection": {
+      "enum": [
+        "asc",
+        "desc"
+      ],
+      "type": "string"
+    },
+    "ThreadListCwdFilter": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ]
+    },
     "ThreadSortKey": {
       "enum": [
         "created_at",
-        "updated_at"
+        "updated_at",
+        "recency_at",
+        "section_position"
       ],
       "type": "string"
     },
@@ -40,11 +62,15 @@
       ]
     },
     "cwd": {
-      "description": "Optional cwd filter; when set, only threads whose session cwd exactly matches this path are returned.",
-      "type": [
-        "string",
-        "null"
-      ]
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadListCwdFilter"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional cwd filter or filters; when set, only threads whose session cwd exactly matches one of these paths are returned."
     },
     "limit": {
       "description": "Optional page size; defaults to a reasonable server-side value.",
@@ -72,6 +98,24 @@
         "null"
       ]
     },
+    "sectionId": {
+      "description": "Omit to include every section, set to `null` for unsectioned threads, or provide a section ID to return only threads in that section.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sortDirection": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SortDirection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional sort direction; defaults to descending (newest first)."
+    },
     "sortKey": {
       "anyOf": [
         {
@@ -92,6 +136,10 @@
         "array",
         "null"
       ]
+    },
+    "useStateDbOnly": {
+      "description": "If true, return from the state DB without scanning JSONL rollouts to repair thread metadata. Omitted or false preserves scan-and-repair behavior.",
+      "type": "boolean"
     }
   },
   "title": "ThreadListParams",

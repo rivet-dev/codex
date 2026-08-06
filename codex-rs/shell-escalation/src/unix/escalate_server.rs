@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,7 +22,6 @@ use crate::unix::escalate_protocol::EscalateRequest;
 use crate::unix::escalate_protocol::EscalateResponse;
 use crate::unix::escalate_protocol::EscalationDecision;
 use crate::unix::escalate_protocol::EscalationExecution;
-use crate::unix::escalate_protocol::LEGACY_BASH_EXEC_WRAPPER_ENV_VAR;
 use crate::unix::escalate_protocol::SuperExecMessage;
 use crate::unix::escalate_protocol::SuperExecResult;
 use crate::unix::escalation_policy::EscalationPolicy;
@@ -32,7 +33,6 @@ use crate::unix::socket::AsyncSocket;
 /// This lets `shell-escalation` own the Unix escalation protocol while the caller
 /// keeps control over process spawning, output capture, and sandbox integration.
 /// Implementations can capture any sandbox state they need.
-#[async_trait::async_trait]
 pub trait ShellCommandExecutor: Send + Sync {
     /// Runs the requested shell command and returns the captured result.
     ///
@@ -42,35 +42,38 @@ pub trait ShellCommandExecutor: Send + Sync {
     /// for the shell process. `after_spawn` should be invoked immediately after
     /// the shell process has been spawned so the parent copy of the inherited
     /// escalation socket can be closed.
-    async fn run(
+    fn run(
         &self,
         command: Vec<String>,
         cwd: PathBuf,
         env_overlay: HashMap<String, String>,
         cancel_rx: CancellationToken,
         after_spawn: Option<Box<dyn FnOnce() + Send>>,
-    ) -> anyhow::Result<ExecResult>;
+    ) -> ShellCommandExecutorFuture<'_, ExecResult>;
 
     /// Prepares an escalated subcommand for execution on the server side.
-    async fn prepare_escalated_exec(
-        &self,
-        program: &AbsolutePathBuf,
-        argv: &[String],
-        workdir: &AbsolutePathBuf,
+    fn prepare_escalated_exec<'a>(
+        &'a self,
+        program: &'a AbsolutePathBuf,
+        argv: &'a [String],
+        workdir: &'a AbsolutePathBuf,
         env: HashMap<String, String>,
         execution: EscalationExecution,
-    ) -> anyhow::Result<PreparedExec>;
+    ) -> ShellCommandExecutorFuture<'a, PreparedExec>;
 }
+
+pub type ShellCommandExecutorFuture<'a, T> =
+    Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ExecParams {
-    /// The the string of Zsh/shell to execute.
+    /// The command string to pass to the shell via `-c` or `-lc`.
     pub command: String,
     /// The working directory to execute the command in. Must be an absolute path.
     pub workdir: String,
     /// The timeout for the command in milliseconds.
     pub timeout_ms: Option<u64>,
-    /// Launch Bash with -lc instead of -c: defaults to true.
+    /// Launch the shell with -lc instead of -c: defaults to true.
     pub login: Option<bool>,
 }
 
@@ -126,18 +129,18 @@ impl Drop for EscalationSession {
 }
 
 pub struct EscalateServer {
-    bash_path: PathBuf,
+    shell_path: PathBuf,
     execve_wrapper: PathBuf,
     policy: Arc<dyn EscalationPolicy>,
 }
 
 impl EscalateServer {
-    pub fn new<Policy>(bash_path: PathBuf, execve_wrapper: PathBuf, policy: Policy) -> Self
+    pub fn new<Policy>(shell_path: PathBuf, execve_wrapper: PathBuf, policy: Policy) -> Self
     where
         Policy: EscalationPolicy + Send + Sync + 'static,
     {
         Self {
-            bash_path,
+            shell_path,
             execve_wrapper,
             policy: Arc::new(policy),
         }
@@ -153,7 +156,7 @@ impl EscalateServer {
         let env_overlay = session.env().clone();
         let client_socket = Arc::clone(&session.client_socket);
         let command = vec![
-            self.bash_path.to_string_lossy().to_string(),
+            self.shell_path.to_string_lossy().to_string(),
             if params.login == Some(false) {
                 "-c".to_string()
             } else {
@@ -209,10 +212,6 @@ impl EscalateServer {
         );
         env.insert(
             EXEC_WRAPPER_ENV_VAR.to_string(),
-            self.execve_wrapper.to_string_lossy().to_string(),
-        );
-        env.insert(
-            LEGACY_BASH_EXEC_WRAPPER_ENV_VAR.to_string(),
             self.execve_wrapper.to_string_lossy().to_string(),
         );
         Ok(EscalationSession {
@@ -279,7 +278,7 @@ async fn handle_escalate_session_with_policy(
         _ = parent_cancellation_token.cancelled() => return Ok(()),
         _ = session_cancellation_token.cancelled() => return Ok(()),
     };
-    let program = AbsolutePathBuf::resolve_path_against_base(file, workdir.as_path())?;
+    let program = AbsolutePathBuf::resolve_path_against_base(file, workdir.as_path());
     let decision = tokio::select! {
         decision = policy.determine_action(&program, &argv, &workdir) => {
             decision.context("failed to determine escalation action")?
@@ -382,9 +381,10 @@ async fn handle_escalate_session_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unix::escalation_policy::EscalationPolicyFuture;
     use codex_protocol::approvals::EscalationPermissions;
+    use codex_protocol::models::AdditionalPermissionProfile as PermissionProfile;
     use codex_protocol::models::NetworkPermissions;
-    use codex_protocol::models::PermissionProfile;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
@@ -396,25 +396,24 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
+    use tokio::sync::Semaphore;
     use tokio::time::Instant;
     use tokio::time::sleep;
 
-    static ESCALATE_SERVER_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
+    static ESCALATE_SERVER_TEST_LOCK: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 
     struct DeterministicEscalationPolicy {
         decision: EscalationDecision,
     }
 
-    #[async_trait::async_trait]
     impl EscalationPolicy for DeterministicEscalationPolicy {
-        async fn determine_action(
-            &self,
-            _file: &AbsolutePathBuf,
-            _argv: &[String],
-            _workdir: &AbsolutePathBuf,
-        ) -> anyhow::Result<EscalationDecision> {
-            Ok(self.decision.clone())
+        fn determine_action<'a>(
+            &'a self,
+            _file: &'a AbsolutePathBuf,
+            _argv: &'a [String],
+            _workdir: &'a AbsolutePathBuf,
+        ) -> EscalationPolicyFuture<'a> {
+            Box::pin(async move { Ok(self.decision.clone()) })
         }
     }
 
@@ -423,42 +422,30 @@ mod tests {
         expected_workdir: AbsolutePathBuf,
     }
 
-    #[async_trait::async_trait]
     impl EscalationPolicy for AssertingEscalationPolicy {
-        async fn determine_action(
-            &self,
-            file: &AbsolutePathBuf,
-            _argv: &[String],
-            workdir: &AbsolutePathBuf,
-        ) -> anyhow::Result<EscalationDecision> {
-            assert_eq!(file, &self.expected_file);
-            assert_eq!(workdir, &self.expected_workdir);
-            Ok(EscalationDecision::run())
+        fn determine_action<'a>(
+            &'a self,
+            file: &'a AbsolutePathBuf,
+            _argv: &'a [String],
+            workdir: &'a AbsolutePathBuf,
+        ) -> EscalationPolicyFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(file, &self.expected_file);
+                assert_eq!(workdir, &self.expected_workdir);
+                Ok(EscalationDecision::run())
+            })
         }
     }
 
     struct ForwardingShellCommandExecutor;
 
-    #[async_trait::async_trait]
-    impl ShellCommandExecutor for ForwardingShellCommandExecutor {
-        async fn run(
-            &self,
-            _command: Vec<String>,
-            _cwd: PathBuf,
-            _env_overlay: HashMap<String, String>,
-            _cancel_rx: CancellationToken,
-            _after_spawn: Option<Box<dyn FnOnce() + Send>>,
-        ) -> anyhow::Result<ExecResult> {
-            unreachable!("run() is not used by handle_escalate_session_with_policy() tests")
-        }
-
+    impl ForwardingShellCommandExecutor {
         async fn prepare_escalated_exec(
             &self,
             program: &AbsolutePathBuf,
             argv: &[String],
             workdir: &AbsolutePathBuf,
             env: HashMap<String, String>,
-            _execution: EscalationExecution,
         ) -> anyhow::Result<PreparedExec> {
             Ok(PreparedExec {
                 command: std::iter::once(program.to_string_lossy().to_string())
@@ -471,23 +458,39 @@ mod tests {
         }
     }
 
-    struct PermissionAssertingShellCommandExecutor {
-        expected_permissions: EscalationPermissions,
-    }
-
-    #[async_trait::async_trait]
-    impl ShellCommandExecutor for PermissionAssertingShellCommandExecutor {
-        async fn run(
+    impl ShellCommandExecutor for ForwardingShellCommandExecutor {
+        fn run(
             &self,
             _command: Vec<String>,
             _cwd: PathBuf,
             _env_overlay: HashMap<String, String>,
             _cancel_rx: CancellationToken,
             _after_spawn: Option<Box<dyn FnOnce() + Send>>,
-        ) -> anyhow::Result<ExecResult> {
-            unreachable!("run() is not used by handle_escalate_session_with_policy() tests")
+        ) -> ShellCommandExecutorFuture<'_, ExecResult> {
+            Box::pin(async {
+                unreachable!("run() is not used by handle_escalate_session_with_policy() tests")
+            })
         }
 
+        fn prepare_escalated_exec<'a>(
+            &'a self,
+            program: &'a AbsolutePathBuf,
+            argv: &'a [String],
+            workdir: &'a AbsolutePathBuf,
+            env: HashMap<String, String>,
+            _execution: EscalationExecution,
+        ) -> ShellCommandExecutorFuture<'a, PreparedExec> {
+            Box::pin(ForwardingShellCommandExecutor::prepare_escalated_exec(
+                self, program, argv, workdir, env,
+            ))
+        }
+    }
+
+    struct PermissionAssertingShellCommandExecutor {
+        expected_permissions: EscalationPermissions,
+    }
+
+    impl PermissionAssertingShellCommandExecutor {
         async fn prepare_escalated_exec(
             &self,
             program: &AbsolutePathBuf,
@@ -508,6 +511,36 @@ mod tests {
                 env,
                 arg0: argv.first().cloned(),
             })
+        }
+    }
+
+    impl ShellCommandExecutor for PermissionAssertingShellCommandExecutor {
+        fn run(
+            &self,
+            _command: Vec<String>,
+            _cwd: PathBuf,
+            _env_overlay: HashMap<String, String>,
+            _cancel_rx: CancellationToken,
+            _after_spawn: Option<Box<dyn FnOnce() + Send>>,
+        ) -> ShellCommandExecutorFuture<'_, ExecResult> {
+            Box::pin(async {
+                unreachable!("run() is not used by handle_escalate_session_with_policy() tests")
+            })
+        }
+
+        fn prepare_escalated_exec<'a>(
+            &'a self,
+            program: &'a AbsolutePathBuf,
+            argv: &'a [String],
+            workdir: &'a AbsolutePathBuf,
+            env: HashMap<String, String>,
+            execution: EscalationExecution,
+        ) -> ShellCommandExecutorFuture<'a, PreparedExec> {
+            Box::pin(
+                PermissionAssertingShellCommandExecutor::prepare_escalated_exec(
+                    self, program, argv, workdir, env, execution,
+                ),
+            )
         }
     }
 
@@ -539,14 +572,10 @@ mod tests {
         after_spawn_invoked: Arc<AtomicBool>,
     }
 
-    #[async_trait::async_trait]
-    impl ShellCommandExecutor for AfterSpawnAssertingShellCommandExecutor {
+    impl AfterSpawnAssertingShellCommandExecutor {
         async fn run(
             &self,
-            _command: Vec<String>,
-            _cwd: PathBuf,
             env_overlay: HashMap<String, String>,
-            _cancel_rx: CancellationToken,
             after_spawn: Option<Box<dyn FnOnce() + Send>>,
         ) -> anyhow::Result<ExecResult> {
             let socket_fd = env_overlay
@@ -565,16 +594,33 @@ mod tests {
                 timed_out: false,
             })
         }
+    }
 
-        async fn prepare_escalated_exec(
+    impl ShellCommandExecutor for AfterSpawnAssertingShellCommandExecutor {
+        fn run(
             &self,
-            _program: &AbsolutePathBuf,
-            _argv: &[String],
-            _workdir: &AbsolutePathBuf,
+            _command: Vec<String>,
+            _cwd: PathBuf,
+            env_overlay: HashMap<String, String>,
+            _cancel_rx: CancellationToken,
+            after_spawn: Option<Box<dyn FnOnce() + Send>>,
+        ) -> ShellCommandExecutorFuture<'_, ExecResult> {
+            Box::pin(AfterSpawnAssertingShellCommandExecutor::run(
+                self,
+                env_overlay,
+                after_spawn,
+            ))
+        }
+
+        fn prepare_escalated_exec<'a>(
+            &'a self,
+            _program: &'a AbsolutePathBuf,
+            _argv: &'a [String],
+            _workdir: &'a AbsolutePathBuf,
             _env: HashMap<String, String>,
             _execution: EscalationExecution,
-        ) -> anyhow::Result<PreparedExec> {
-            unreachable!("prepare_escalated_exec() is not used by exec() tests")
+        ) -> ShellCommandExecutorFuture<'a, PreparedExec> {
+            Box::pin(async { unreachable!("prepare_escalated_exec() is not used by exec() tests") })
         }
     }
 
@@ -595,18 +641,18 @@ mod tests {
     /// overlay and does not need to touch the configured shell or wrapper
     /// executable paths.
     ///
-    /// The `/bin/bash` and `/tmp/codex-execve-wrapper` values here are
+    /// The `/bin/zsh` and `/tmp/codex-execve-wrapper` values here are
     /// intentionally fake sentinels: this test asserts that the paths are
     /// copied into the exported environment and that the socket fd stays valid
     /// until `close_client_socket()` is called.
     #[tokio::test]
     async fn start_session_exposes_wrapper_env_overlay() -> anyhow::Result<()> {
-        let _guard = ESCALATE_SERVER_TEST_LOCK.lock().await;
+        let _guard = ESCALATE_SERVER_TEST_LOCK.acquire().await?;
         let execve_wrapper = PathBuf::from("/tmp/codex-execve-wrapper");
         let execve_wrapper_str = execve_wrapper.to_string_lossy().to_string();
         let server = EscalateServer::new(
-            PathBuf::from("/bin/bash"),
-            execve_wrapper.clone(),
+            PathBuf::from("/bin/zsh"),
+            execve_wrapper,
             DeterministicEscalationPolicy {
                 decision: EscalationDecision::run(),
             },
@@ -618,10 +664,6 @@ mod tests {
         )?;
         let env = session.env();
         assert_eq!(env.get(EXEC_WRAPPER_ENV_VAR), Some(&execve_wrapper_str));
-        assert_eq!(
-            env.get(LEGACY_BASH_EXEC_WRAPPER_ENV_VAR),
-            Some(&execve_wrapper_str)
-        );
         let socket_fd = env
             .get(ESCALATE_SOCKET_ENV_VAR)
             .expect("session should export shell escalation socket");
@@ -647,7 +689,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_closes_parent_socket_after_shell_spawn() -> anyhow::Result<()> {
-        let _guard = ESCALATE_SERVER_TEST_LOCK.lock().await;
+        let _guard = ESCALATE_SERVER_TEST_LOCK.acquire().await?;
         let after_spawn_invoked = Arc::new(AtomicBool::new(false));
         let server = EscalateServer::new(
             PathBuf::from("/bin/bash"),
@@ -681,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_escalate_session_respects_run_in_sandbox_decision() -> anyhow::Result<()> {
-        let _guard = ESCALATE_SERVER_TEST_LOCK.lock().await;
+        let _guard = ESCALATE_SERVER_TEST_LOCK.acquire().await?;
         let (server, client) = AsyncSocket::pair()?;
         let server_task = tokio::spawn(handle_escalate_session_with_policy(
             server,
@@ -721,13 +763,13 @@ mod tests {
     #[tokio::test]
     async fn handle_escalate_session_resolves_relative_file_against_request_workdir()
     -> anyhow::Result<()> {
-        let _guard = ESCALATE_SERVER_TEST_LOCK.lock().await;
+        let _guard = ESCALATE_SERVER_TEST_LOCK.acquire().await?;
         let (server, client) = AsyncSocket::pair()?;
         let tmp = tempfile::TempDir::new()?;
         let workdir = tmp.path().join("workspace");
         std::fs::create_dir(&workdir)?;
         let workdir = AbsolutePathBuf::try_from(workdir)?;
-        let expected_file = workdir.join("bin/tool")?;
+        let expected_file = workdir.join("bin/tool");
         let server_task = tokio::spawn(handle_escalate_session_with_policy(
             server,
             Arc::new(AssertingEscalationPolicy {
@@ -760,7 +802,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_escalate_session_executes_escalated_command() -> anyhow::Result<()> {
-        let _guard = ESCALATE_SERVER_TEST_LOCK.lock().await;
+        let _guard = ESCALATE_SERVER_TEST_LOCK.acquire().await?;
         let (server, client) = AsyncSocket::pair()?;
         let server_task = tokio::spawn(handle_escalate_session_with_policy(
             server,
@@ -853,7 +895,7 @@ mod tests {
     #[tokio::test]
     async fn handle_escalate_session_accepts_received_fds_that_overlap_destinations()
     -> anyhow::Result<()> {
-        let _guard = ESCALATE_SERVER_TEST_LOCK.lock().await;
+        let _guard = ESCALATE_SERVER_TEST_LOCK.acquire().await?;
         let mut pipe_fds = [0; 2];
         if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == -1 {
             return Err(std::io::Error::last_os_error().into());
@@ -925,13 +967,13 @@ mod tests {
 
     #[tokio::test]
     async fn handle_escalate_session_passes_permissions_to_executor() -> anyhow::Result<()> {
-        let _guard = ESCALATE_SERVER_TEST_LOCK.lock().await;
+        let _guard = ESCALATE_SERVER_TEST_LOCK.acquire().await?;
         let (server, client) = AsyncSocket::pair()?;
         let server_task = tokio::spawn(handle_escalate_session_with_policy(
             server,
             Arc::new(DeterministicEscalationPolicy {
                 decision: EscalationDecision::escalate(EscalationExecution::Permissions(
-                    EscalationPermissions::PermissionProfile(PermissionProfile {
+                    EscalationPermissions::AdditionalPermissionProfile(PermissionProfile {
                         network: Some(NetworkPermissions {
                             enabled: Some(true),
                         }),
@@ -940,12 +982,14 @@ mod tests {
                 )),
             }),
             Arc::new(PermissionAssertingShellCommandExecutor {
-                expected_permissions: EscalationPermissions::PermissionProfile(PermissionProfile {
-                    network: Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    ..Default::default()
-                }),
+                expected_permissions: EscalationPermissions::AdditionalPermissionProfile(
+                    PermissionProfile {
+                        network: Some(NetworkPermissions {
+                            enabled: Some(true),
+                        }),
+                        ..Default::default()
+                    },
+                ),
             }),
             CancellationToken::new(),
             CancellationToken::new(),
@@ -981,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_session_aborts_intercept_workers_and_kills_spawned_child()
     -> anyhow::Result<()> {
-        let _guard = ESCALATE_SERVER_TEST_LOCK.lock().await;
+        let _guard = ESCALATE_SERVER_TEST_LOCK.acquire().await?;
         let tmp = TempDir::new()?;
         let pid_file = tmp.path().join("escalated-child.pid");
         let pid_file_display = pid_file.display().to_string();
