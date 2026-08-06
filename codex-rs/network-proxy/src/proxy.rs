@@ -1268,6 +1268,11 @@ impl NetworkProxy {
             return Ok(NetworkProxyHandle::noop());
         }
 
+        #[cfg(target_os = "wasi")]
+        anyhow::bail!(
+            "Codex's managed proxy cannot run inside an agentOS VM; proxy execution and network policy are owned by the trusted agentOS sidecar"
+        );
+
         if !unix_socket_permissions_supported() {
             warn!(
                 "allowUnixSockets and dangerouslyAllowAllUnixSockets are macOS-only; requests will be rejected on this platform"
