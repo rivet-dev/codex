@@ -81,7 +81,7 @@ impl PathUri {
             return uri;
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "wasi"))]
         let path_bytes = {
             use std::os::unix::ffi::OsStrExt;
             path.as_path().as_os_str().as_bytes().to_vec()
@@ -440,7 +440,7 @@ impl PathUri {
             ));
         }
         if let Some(path_bytes) = decode_bad_path_uri(&self.0) {
-            #[cfg(unix)]
+            #[cfg(any(unix, target_os = "wasi"))]
             let decoded_path = {
                 use std::os::unix::ffi::OsStringExt;
                 Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
@@ -832,7 +832,7 @@ impl PathConvention {
     }
 
     /// Returns the path convention used by the current process.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     pub const fn native() -> Self {
         Self::Posix
     }
