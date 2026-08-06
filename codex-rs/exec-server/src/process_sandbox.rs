@@ -306,46 +306,58 @@ async fn prepare_managed_network(
     ),
     JSONRPCErrorError,
 > {
-    let Some(network_proxy) = network_proxy.cloned() else {
+    #[cfg(target_os = "wasi")]
+    {
+        if network_proxy.is_some() {
+            return Err(invalid_params(
+                "remote Codex network-proxy launch is unavailable in agentOS VMs; network policy and proxy execution are owned by the trusted agentOS sidecar"
+                    .to_string(),
+            ));
+        }
         return Ok((env, managed_network.cloned(), None, None));
-    };
-    let state = NetworkProxyState::from_remote_launch_config(network_proxy)
-        .map_err(|err| invalid_params(format!("invalid network proxy config: {err}")))?;
-    let mut builder = NetworkProxy::builder().state(Arc::new(state));
-    if let Some(network_policy_decider) = network_policy_decider {
-        builder = builder.policy_decider_arc(network_policy_decider);
     }
-    let proxy = builder
-        .build()
-        .await
-        .map_err(|err| internal_error(format!("failed to build executor network proxy: {err}")))?;
-    let handle = proxy
-        .run()
-        .await
-        .map_err(|err| internal_error(format!("failed to start executor network proxy: {err}")))?;
-    #[cfg(target_os = "windows")]
-    let network_proxy_restricting_sid = Some(
-        proxy
-            .network_proxy_restricting_sid(/*environment_id*/ None)
-            .ok_or_else(|| {
-                internal_error(
-                    "managed Windows proxy route is missing its restricting SID".to_string(),
-                )
-            })?,
-    );
-    #[cfg(not(target_os = "windows"))]
-    let network_proxy_restricting_sid = None;
-    let prepared = proxy
-        .prepare_for_optional_environment(env, /*environment_id*/ None)
-        .map_err(|err| {
-            internal_error(format!("failed to prepare executor network proxy: {err}"))
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let Some(network_proxy) = network_proxy.cloned() else {
+            return Ok((env, managed_network.cloned(), None, None));
+        };
+        let state = NetworkProxyState::from_remote_launch_config(network_proxy)
+            .map_err(|err| invalid_params(format!("invalid network proxy config: {err}")))?;
+        let mut builder = NetworkProxy::builder().state(Arc::new(state));
+        if let Some(network_policy_decider) = network_policy_decider {
+            builder = builder.policy_decider_arc(network_policy_decider);
+        }
+        let proxy = builder.build().await.map_err(|err| {
+            internal_error(format!("failed to build executor network proxy: {err}"))
         })?;
-    Ok((
-        prepared.env,
-        Some(prepared.sandbox_context),
-        Some(handle),
-        network_proxy_restricting_sid,
-    ))
+        let handle = proxy.run().await.map_err(|err| {
+            internal_error(format!("failed to start executor network proxy: {err}"))
+        })?;
+        #[cfg(target_os = "windows")]
+        let network_proxy_restricting_sid = Some(
+            proxy
+                .network_proxy_restricting_sid(/*environment_id*/ None)
+                .ok_or_else(|| {
+                    internal_error(
+                        "managed Windows proxy route is missing its restricting SID".to_string(),
+                    )
+                })?,
+        );
+        #[cfg(not(target_os = "windows"))]
+        let network_proxy_restricting_sid = None;
+        let prepared = proxy
+            .prepare_for_optional_environment(env, /*environment_id*/ None)
+            .map_err(|err| {
+                internal_error(format!("failed to prepare executor network proxy: {err}"))
+            })?;
+        Ok((
+            prepared.env,
+            Some(prepared.sandbox_context),
+            Some(handle),
+            network_proxy_restricting_sid,
+        ))
+    }
 }
 
 fn native_path(path: &PathUri, label: &str) -> Result<AbsolutePathBuf, JSONRPCErrorError> {
