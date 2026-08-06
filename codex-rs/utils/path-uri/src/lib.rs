@@ -83,7 +83,10 @@ impl PathUri {
 
         #[cfg(any(unix, target_os = "wasi"))]
         let path_bytes = {
+            #[cfg(unix)]
             use std::os::unix::ffi::OsStrExt;
+            #[cfg(target_os = "wasi")]
+            use std::os::wasi::ffi::OsStrExt;
             path.as_path().as_os_str().as_bytes().to_vec()
         };
         #[cfg(windows)]
@@ -442,7 +445,10 @@ impl PathUri {
         if let Some(path_bytes) = decode_bad_path_uri(&self.0) {
             #[cfg(any(unix, target_os = "wasi"))]
             let decoded_path = {
+                #[cfg(unix)]
                 use std::os::unix::ffi::OsStringExt;
+                #[cfg(target_os = "wasi")]
+                use std::os::wasi::ffi::OsStringExt;
                 Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
                     path_bytes,
                 )))
