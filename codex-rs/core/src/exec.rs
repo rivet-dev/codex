@@ -1187,7 +1187,7 @@ fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
 #[cfg(target_os = "wasi")]
 fn synthetic_exit_status(code: i32) -> ExitStatus {
     use std::os::wasi::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(code as u32)
+    std::process::ExitStatus::from_raw(code)
 }
 
 #[cfg(target_os = "wasi")]
