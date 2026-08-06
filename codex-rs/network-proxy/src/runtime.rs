@@ -6,6 +6,7 @@ use crate::credential_broker::CredentialBroker;
 use crate::mitm::MitmState;
 use crate::mitm_hook::HookEvaluation;
 use crate::mitm_hook::MitmHooksByHost;
+#[cfg(not(target_os = "wasi"))]
 use crate::mitm_hook::evaluate_mitm_hooks;
 use crate::policy::Host;
 use crate::policy::is_loopback_host;
@@ -418,6 +419,7 @@ impl NetworkProxyState {
         self.credential_broker.virtualize_child_env(env);
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub fn inject_request_credentials(&self, host: &str, headers: &mut rama_http::HeaderMap) {
         self.credential_broker.inject_request_headers(host, headers);
     }
@@ -732,6 +734,7 @@ impl NetworkProxyState {
         Ok(guard.mitm.clone())
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) async fn evaluate_mitm_hook_request(
         &self,
         host: &str,

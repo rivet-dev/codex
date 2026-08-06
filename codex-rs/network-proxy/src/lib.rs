@@ -1,5 +1,9 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+#[cfg(not(target_os = "wasi"))]
+mod attribution;
+#[cfg(target_os = "wasi")]
+#[path = "attribution_wasi.rs"]
 mod attribution;
 #[cfg(not(target_os = "wasi"))]
 mod certs;
@@ -7,7 +11,12 @@ mod certs;
 #[path = "certs_wasi.rs"]
 mod certs;
 mod config;
+#[cfg(not(target_os = "wasi"))]
 mod connect_policy;
+#[cfg(not(target_os = "wasi"))]
+mod credential_broker;
+#[cfg(target_os = "wasi")]
+#[path = "credential_broker_wasi.rs"]
 mod credential_broker;
 #[cfg(not(target_os = "wasi"))]
 mod http_proxy;
@@ -19,7 +28,12 @@ mod mitm;
 #[cfg(target_os = "wasi")]
 #[path = "mitm_wasi.rs"]
 mod mitm;
+#[cfg(not(target_os = "wasi"))]
 mod mitm_hook;
+#[cfg(target_os = "wasi")]
+#[path = "mitm_hook_wasi.rs"]
+mod mitm_hook;
+#[cfg(not(target_os = "wasi"))]
 mod native_certs;
 mod network_policy;
 mod policy;
